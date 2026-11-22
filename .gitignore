@@ -12,3 +12,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Кэш числа сообщений по чатам (личные данные)
+chat_counts.json

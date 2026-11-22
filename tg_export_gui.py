@@ -92,7 +92,7 @@ MESSAGES_PER_PAGE = 1000
 def build_missing_reason():
     return {
         "disabled": "Не скачано: этот тип отключён в настройках экспорта",
-        "too_big": f"Не скачано: больше лимита {SIZE_LIMIT_MB} МБ",
+        "too_big": f"Не скачано: больше лимита {SIZE_LIMIT_MB} МБ" if SIZE_LIMIT_MB else "Не скачано",
         "failed": "Не удалось скачать (файл недоступен или загрузка зависла)",
         "no_space": "Не скачано: закончилось место на диске",
         "missing": "Файл не найден",
@@ -1796,9 +1796,11 @@ async def download_one(client, msg, path, size, bar, obj=None):
     return path
 
 
-def make_client(cfg, log):
+def make_client(cfg, log, session=None, quick=False):
     kwargs = dict(connection_retries=10, retry_delay=3, request_retries=10, timeout=30,
                   flood_sleep_threshold=120)
+    if quick:      # диагностика: не ждать минутами, а быстро сказать «не работает»
+        kwargs.update(connection_retries=1, retry_delay=1, request_retries=1, timeout=12, auto_reconnect=False)
     ptype = cfg["proxy_type"]
     if ptype == "mtproto":
         host, port, secret = cfg["proxy_host"], cfg["proxy_port"], cfg["proxy_secret"]
@@ -1830,7 +1832,8 @@ def make_client(cfg, log):
         }
     else:
         log("Подключение напрямую (без прокси)")
-    return TelegramClient(SESSION_PATH, int(cfg["api_id"]), cfg["api_hash"].strip(), **kwargs)
+    return TelegramClient(session if session is not None else SESSION_PATH, int(cfg["api_id"]),
+                          cfg["api_hash"].strip(), **kwargs)
 
 
 class StopRequested(Exception):
@@ -1970,6 +1973,10 @@ def describe_code(sent, log):
         extra += "."
     log(f"Код отправлен {where}.{extra}")
     return where
+
+
+def now_ago(t):
+    return time.monotonic() - t
 
 
 def fmt_when(secs):
@@ -2148,7 +2155,7 @@ def chat_status(d, types, limit_mb):
         v = None
     r["msgs"] = cache.get("total_msgs", 0)
     r["msg_total"] = cache.get("msg_total", 0) or 0
-    limit = int(limit_mb) * 1024 * 1024
+    limit = int(limit_mb) * 1024 * 1024 if int(limit_mb or 0) > 0 else float("inf")
     media = cache.get("media") or cache.get("wanted") or {}
     wanted = {k: x for k, x in media.items() if types.get(x[0]) and x[1] <= limit}
     r["want"] = len(wanted)
@@ -2272,6 +2279,9 @@ class FloodWaitLog(logging.Handler):
                          r"Connection reset|timed out|Error while connecting", text, re.I):
                 self.worker.net_issue(text)
                 return
+            if re.search(r"Connection to .* complete", text):
+                self.worker.net_ok()
+                return
             m = re.search(r"Sleeping for (\d+)s", text)
             if m:
                 secs = int(m.group(1))
@@ -2315,6 +2325,20 @@ class Worker:
             self._net_last_log = now
             self.log("📡 Не удаётся связаться с Telegram (" + str(detail)[:120] + "). Похоже, нет интернета, "
                      "выключен VPN или не запущен прокси. Программа продолжит сама, когда связь появится.")
+
+    def net_ok(self):
+        """Связь восстановилась — убираем предупреждение сразу, а не через минуту."""
+        if now_ago(getattr(self, "net_issue_at", -1e9)) < 600:
+            self.log("📡 Связь с Telegram восстановлена.")
+        self.net_issue_at = -1e9
+
+    def recheck_now(self):
+        """Кнопка «Проверить снова»: не ждать паузу между попытками, а проверить связь сразу."""
+        def fire():
+            ev = getattr(self, "_recheck_evt", None)
+            if ev is not None:
+                ev.set()
+        self.loop.call_soon_threadsafe(fire)
 
     # ---- паузы Telegram и прогноз окончания сканирования ----
     def scan_begin(self, n0):
@@ -2372,12 +2396,19 @@ class Worker:
     async def _wait_online(self):
         """Ждёт, пока вернётся связь с Telegram (интернет, VPN или прокси), сколько бы это ни заняло."""
         delay = 15
+        self._recheck_evt = asyncio.Event()
         while not await self._is_online():
+            self.net_issue_at = time.monotonic()
             self.log(f"📡 Нет связи с Telegram. Проверю снова через {delay} с — "
                      "продолжу сам, как только связь появится.")
-            self.phase(f"Нет связи с Telegram — жду (повтор через {delay} с)...")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 300)
+            self.phase(f"📡 Нет связи с Telegram — следующая проверка через {delay} с (или нажмите «Проверить снова»)")
+            try:
+                await asyncio.wait_for(self._recheck_evt.wait(), delay)
+                delay = 15                      # проверили по кнопке — дальше снова с короткой паузы
+            except asyncio.TimeoutError:
+                delay = min(delay * 2, 300)
+            self._recheck_evt.clear()
+        self.net_ok()
 
     def _run(self):
         asyncio.set_event_loop(self.loop)
@@ -2579,6 +2610,105 @@ class Worker:
         if self.client:
             asyncio.run_coroutine_threadsafe(job(), self.loop)
 
+    async def count_many(self, ids):
+        """Сообщений в каждом из чатов — по одному запросу на чат, с прогрессом и возможностью остановить."""
+        self.count_stop = False
+        n = len(ids)
+        for i, chat in enumerate(ids, 1):
+            if self.count_stop or not self.client:
+                break
+            try:
+                target = int(chat) if str(chat).lstrip("-").isdigit() else chat
+                r = await self.client.get_messages(target, limit=0)
+                self.q.put(("chat_count", str(chat), getattr(r, "total", 0) or 0))
+            except Exception:
+                self.q.put(("chat_count", str(chat), None))
+            self.q.put(("count_progress", i, n))
+        self.q.put(("count_progress", n, n))
+
+    async def _test_media(self, chats):
+        """Файл для замера скорости: самое большое видео/документ из первых подходящих чатов."""
+        from telethon.tl.types import InputMessagesFilterVideo, InputMessagesFilterDocument
+        best = None
+        for chat in chats[:6]:
+            for flt in (InputMessagesFilterVideo, InputMessagesFilterDocument):
+                try:
+                    target = int(chat) if str(chat).lstrip("-").isdigit() else chat
+                    async for m in self.client.iter_messages(target, limit=15, filter=flt()):
+                        obj = media_object(m)
+                        sz = media_size(m, obj) if obj is not None else 0
+                        if sz and (best is None or sz > best[1]):
+                            best = (obj, sz)
+                except Exception:
+                    pass
+            if best and best[1] >= 8 * 1024 * 1024:
+                break
+        return best
+
+    async def diagnose(self, variants, chats):
+        """Проверка вариантов подключения: время подключения, пинг (5 замеров) и скорость скачивания
+        настоящего файла (до 8 с). Работает отдельным временным соединением — текущий экспорт не прерывается."""
+        import random
+        import statistics
+        from telethon.sessions import StringSession
+        from telethon.tl.functions import PingRequest
+        auth = ""
+        if self.client:
+            try:
+                auth = StringSession.save(self.client.session)
+            except Exception:
+                auth = ""
+        media = None
+        if self.client and auth:
+            self.q.put(("diag_note", "Ищу файл для замера скорости…"))
+            media = await self._test_media(chats)
+        self.q.put(("diag_note", "" if media else
+                    "Подходящего файла для замера скорости не нашлось — проверяю только подключение и пинг."))
+        for label, cfg in variants:
+            res = {"label": label, "ok": False, "connect": None, "ping": None, "speed": None, "error": ""}
+            self.q.put(("diag", label, "running", dict(res)))
+            client = None
+            try:
+                client = make_client(cfg, lambda *_: None, session=StringSession(auth), quick=True)
+                t0 = time.monotonic()
+                await asyncio.wait_for(client.connect(), 25)
+                res["connect"] = time.monotonic() - t0
+                pings = []
+                for _ in range(5):
+                    t = time.monotonic()
+                    await asyncio.wait_for(client(PingRequest(ping_id=random.getrandbits(63))), 15)
+                    pings.append((time.monotonic() - t) * 1000)
+                res["ping"] = statistics.median(pings)
+                if media is not None:
+                    got, t = 0, time.monotonic()
+
+                    async def pull():
+                        nonlocal got
+                        async for chunk in client.iter_download(media[0], request_size=512 * 1024,
+                                                                file_size=media[1]):
+                            got += len(chunk)
+                            if time.monotonic() - t > 8 or got >= 24 * 1024 * 1024:
+                                break
+                    try:
+                        await asyncio.wait_for(pull(), 20)
+                    except asyncio.TimeoutError:
+                        pass
+                    dt = max(0.001, time.monotonic() - t)
+                    res["speed"] = got / dt if got else 0.0
+                res["ok"] = True
+            except (asyncio.CancelledError, StopRequested):
+                raise
+            except Exception as e:
+                res["error"] = (str(e) or type(e).__name__)[:120]
+            finally:
+                if client is not None:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), 5)
+                    except Exception:
+                        pass
+            self.q.put(("diag", label, "done", res))
+        self.q.put(("diag_done",))
+
     async def logout(self):
         if self.client:
             try:
@@ -2624,7 +2754,7 @@ class Worker:
         try:
             tk_ = self.client.takeout(finalize=True, users=True, chats=True, megagroups=True,
                                       channels=True, files=True,
-                                      max_file_size=int(cfg["size_limit_mb"]) * 1024 * 1024)
+                                      max_file_size=(int(cfg["size_limit_mb"]) or 4096) * 1024 * 1024)
             self.hist = await stack.enter_async_context(tk_)
             self.log("⚡ Включён режим экспорта Telegram: меньше пауз при чтении истории. "
                      "На других ваших устройствах Telegram может показать уведомление о запросе экспорта — это он.")
@@ -2917,7 +3047,7 @@ class Worker:
         types = cfg["types"]
         retries = int(cfg["retries"])
         reserve = int(cfg["disk_reserve_mb"]) * 1024 * 1024
-        limit = SIZE_LIMIT_MB * 1024 * 1024
+        limit = SIZE_LIMIT_MB * 1024 * 1024 if SIZE_LIMIT_MB > 0 else float("inf")   # 0 — без ограничения
 
         if not self.client:
             raise ValueError("Сначала подключитесь к Telegram (страница «Подключение»).")
@@ -4004,6 +4134,7 @@ class App:
         self.ex_running_iid = None
         self.ui = UI(root)
         self.S = self.ui.s
+        self.load_counts()
         root.title("Telegram Chat Exporter")
         self._make_vars()
         self.ui.apply(self.theme_mode())
@@ -4046,7 +4177,8 @@ class App:
         self.v_puser = tk.StringVar(value=c["proxy_user"])
         self.v_ppass = tk.StringVar(value=c["proxy_pass"])
         self.v_types = {k: tk.BooleanVar(value=c["types"].get(k, True)) for k in TYPE_LABELS}
-        self.v_limit = tk.IntVar(value=int(c["size_limit_mb"]))
+        self.v_limit = tk.IntVar(value=int(c["size_limit_mb"]) or 4000)
+        self.v_unlimited = tk.BooleanVar(value=int(c["size_limit_mb"] or 0) == 0)
         self.v_html = tk.BooleanVar(value=c["make_html"])
         self.v_json = tk.BooleanVar(value=c["make_json"])
         self.v_auto = tk.BooleanVar(value=c.get("auto_download", True))
@@ -4066,6 +4198,7 @@ class App:
         self.v_details_tab = tk.StringVar(value=c.get("details_tab", "general"))
         self.v_graph_period = tk.StringVar(value=str(c.get("graph_period", "300")))
         self.v_ex_filter = tk.StringVar(value=self.EX_FILTERS[0])
+        self.v_plink.trace_add("write", lambda *a: self.fill_from_link())
         self.v_manual = tk.StringVar()      # ручной ввод: @username, ссылка или ID (если чата нет в списке)
         self.v_manual.trace_add("write", lambda *a: self.on_manual_chat())
         self.v_search.trace_add("write", lambda *a: self.fill_dialogs())
@@ -4308,11 +4441,30 @@ class App:
         left.grid(row=0, column=0, sticky="nsew")
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
-        self.e_search = ttk.Entry(left, textvariable=self.v_search)
-        self.e_search.grid(row=0, column=0, sticky="ew", pady=(0, S(10)))
+        sr = ttk.Frame(left)
+        sr.grid(row=0, column=0, sticky="ew", pady=(0, S(10)))
+        sr.columnconfigure(0, weight=1)
+        self.e_search = ttk.Entry(sr, textvariable=self.v_search)
+        self.e_search.grid(row=0, column=0, sticky="ew")
+        self.b_count_all = ttk.Button(sr, text="Посчитать сообщения", style="Link.TButton", command=self.count_all)
+        self.b_count_all.grid(row=0, column=1, sticky="e", padx=(S(10), 0))
+        self.count_bar = ttk.Frame(left)
+        self.count_bar.columnconfigure(1, weight=1)
+        self.l_count_prog = ttk.Label(self.count_bar, text="", style="Small.TLabel")
+        self.l_count_prog.grid(row=0, column=0, sticky="w", padx=(0, S(10)))
+        self.pb_count = ttk.Progressbar(self.count_bar, mode="determinate", maximum=1)
+        self.pb_count.grid(row=0, column=1, sticky="ew")
+        ttk.Button(self.count_bar, text="Остановить", style="Link.TButton", command=self.stop_counting).grid(
+            row=0, column=2, sticky="e", padx=(S(8), 0))
         self.placeholder(self.e_search, self.v_search, "Найти чат: название, ID, @username или ссылка t.me")
-        box, tv = self.make_tree(left, (("name", "Чат", S(340), "w", False), ("kind", "Тип", S(110), "w", False)),
+        box, tv = self.make_tree(left, (("name", "Чат", S(340), "w", False), ("kind", "Тип", S(110), "w", False),
+                                        ("msgs", "Сообщений", S(130), "e", False)),
                                  selectmode="extended", key="chats", checkbox=True)
+        self.chat_sort = (None, False)
+        for col in ("name", "kind", "msgs"):
+            tv.heading(col, command=lambda c=col: self.sort_chats(c))
+        self.count_bar.grid(row=3, column=0, sticky="ew", pady=(S(8), 0))
+        self.count_bar.grid_remove()
         tv.heading("#0", image=self.ui.tree_cb["off"], command=self.toggle_all_checks)
         tv.bind("<Button-1>", self.on_chat_click)
         tv.bind("<space>", lambda e: (self.toggle_checks(self.tv.selection()), "break")[1])
@@ -4359,12 +4511,18 @@ class App:
         lf.grid(row=6, column=0, sticky="ew", pady=(S(18), S(6)))
         lf.columnconfigure(0, weight=1)
         ttk.Label(lf, text="Максимальный размер файла", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.l_limit = ttk.Label(lf, text="", style="Muted.TLabel")
-        self.l_limit.grid(row=0, column=1, sticky="e")
-        ttk.Scale(right, from_=1, to=4000, variable=self.v_limit, orient="horizontal",
-                  command=lambda v: self.l_limit.configure(text=f"до {int(float(v))} МБ")).grid(
-            row=7, column=0, sticky="ew")
-        self.l_limit.configure(text=f"до {self.v_limit.get()} МБ")
+        self.sp_limit = ttk.Spinbox(lf, from_=1, to=4096, textvariable=self.v_limit, width=6, increment=50)
+        self.sp_limit.grid(row=0, column=1, sticky="e")
+        ttk.Label(lf, text="МБ", style="Muted.TLabel").grid(row=0, column=2, sticky="e", padx=(S(6), 0))
+        sf_ = ttk.Frame(right)
+        sf_.grid(row=7, column=0, sticky="ew")
+        sf_.columnconfigure(0, weight=1)
+        self.sc_limit = ttk.Scale(sf_, from_=1, to=4096, variable=self.v_limit, orient="horizontal",
+                                  command=lambda v: self.v_limit.set(int(float(v))))
+        self.sc_limit.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(sf_, text="Без ограничения", variable=self.v_unlimited,
+                        command=self.update_limit_state).grid(row=0, column=1, sticky="e", padx=(S(14), 0))
+        self.update_limit_state()
 
         self.section(right, "После сканирования", 8)
         Segmented(right, self.v_auto, [(True, "Сразу скачивать"), (False, "Показать сводку")],
@@ -4383,6 +4541,11 @@ class App:
             row=0, column=1, sticky="e")
         self.b_start = ttk.Button(right, text="Начать экспорт", style="Accent.TButton", command=self.on_start)
         self.b_start.grid(row=22, column=0, sticky="ew", ipady=S(3))
+
+    def update_limit_state(self):
+        st = "disabled" if self.v_unlimited.get() else "normal"
+        self.sp_limit.configure(state=st)
+        self.sc_limit.state(["disabled"] if self.v_unlimited.get() else ["!disabled"])
 
     def update_dest(self):
         if not hasattr(self, "l_dest"):
@@ -4445,10 +4608,19 @@ class App:
         """Режим: продолжить / пересканировать / экспорт из сохранённой версии сканирования."""
         if not hasattr(self, "cb_version"):
             return
-        opts = [(self.VERSION_NEW, None), (self.VERSION_FULL, "full")]
+        chat = self.v_chat.get().strip()
+        try:
+            dirs = find_chat_dirs(self.v_out.get().strip(), chat)
+        except Exception:
+            dirs = []
+        started = any(os.path.exists(os.path.join(d, "scan_cache.json")) for d in dirs)
+        if chat.lstrip("-").isdigit() and not started:
+            opts = [("Новый экспорт: вся история", None)]       # продолжать ещё нечего
+        else:
+            opts = [(self.VERSION_NEW, None), (self.VERSION_FULL, "full")]
         try:
             seen = set()
-            for d in find_chat_dirs(self.v_out.get().strip(), self.v_chat.get().strip()):
+            for d in dirs:
                 for m in list_snapshots(d):
                     if m["id"] in seen:
                         continue
@@ -4517,7 +4689,7 @@ class App:
                 ("speed", "Скорость", W("999 сообщ./с"), "e", False),
                 ("eta", "Осталось", W("~23 ч 59 мин"), "e", False),
                 ("files", "Файлы", W("41784 / 41784 ⚠9"), "e", False),
-                ("size", "Объём", W("999.9 ГБ"), "e", False),
+                ("size", "Объём файлов", W("999.9 ГБ из 999.9 ГБ"), "e", False),
                 ("msgs", "Сообщений", W("354 176 / 354 176"), "e", False),
                 ("upd", "Обновлён", W("22.11 19:39"), "center", False),
                 ("ver", "Версий", W("Версий"), "center", False))
@@ -4578,8 +4750,10 @@ class App:
         self.net_warn = ttk.Frame(g)
         self.l_net_warn = ttk.Label(self.net_warn, text="", style="Warning.TLabel", justify="left")
         self.l_net_warn.pack(side="left")
+        ttk.Button(self.net_warn, text="Проверить снова", style="Link.TButton",
+                   command=self.recheck).pack(side="left", padx=(S(8), 0))
         ttk.Button(self.net_warn, text="Настройки подключения", style="Link.TButton",
-                   command=lambda: self.show_page("conn")).pack(side="left", padx=(S(8), 0))
+                   command=lambda: self.show_page("conn")).pack(side="left", padx=(S(4), 0))
         self.net_warn.grid(row=5, column=0, sticky="w", pady=(S(6), 0))
         self.net_warn.grid_remove()
         g.bind("<Configure>", lambda e: self.l_net_warn.configure(wraplength=max(S(240), e.width - S(260))), add="+")
@@ -4736,11 +4910,21 @@ class App:
     QUIET_PHASES = ("⏸", "⛔", "Пауза", "Сохраняю", "Создаю", "Собираю", "Проверяю", "Докачиваю", "Кастомные")
     NET_HINT = "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси"
 
+    def recheck(self):
+        """«Проверить снова»: сразу проверить связь, не дожидаясь следующей попытки."""
+        self.worker.recheck_now()
+        self._wd_t = time.monotonic()
+        self.set_phase("Проверяю связь с Telegram…")
+
     def watchdog(self, now, st, p):
         """Если долго ничего не меняется — скорее всего нет связи; подсказываем, что проверить."""
-        sig = (st.get("stage"), st.get("msg_n"), p.n, st.get("ok"), self.l_phase.cget("text"))
+        sig = (st.get("stage"), st.get("msg_n"), p.n, st.get("ok"))
         if sig != getattr(self, "_wd_sig", None):
+            if getattr(self, "_wd_sig", None) is not None and now - getattr(self.worker, "net_issue_at", -1e9) > 3:
+                self.worker.net_issue_at = -1e9      # работа пошла — связь есть, предупреждение снимаем
             self._wd_sig, self._wd_t = sig, now
+        if self.l_phase.cget("text") != getattr(self, "_wd_phase", None):
+            self._wd_phase, self._wd_t = self.l_phase.cget("text"), now
         stalled = now - getattr(self, "_wd_t", now)
         si = getattr(self.worker, "scan_info", None) or {}
         net_recent = now - getattr(self.worker, "net_issue_at", -1e9) < 90
@@ -4879,7 +5063,14 @@ class App:
             files = f"{r['done']} / {r['want']}" if r["want"] else ("—" if r["dir"] else "")
             if r["failed"]:
                 files += f" ⚠{r['failed']}"
-            size = human(r["want_bytes"]) if r["want_bytes"] else ""
+            if not r["want_bytes"]:
+                size = ""
+            elif r["code"] == "done":
+                size = human(r["want_bytes"])
+            elif r["code"] == "scan":
+                size = f"найдено {human(r['want_bytes'])}"        # ещё ищем — это не скачанное
+            else:
+                size = f"{human(r['done_bytes'])} из {human(r['want_bytes'])}"
             upd = _dt.datetime.fromtimestamp(r["updated"]).strftime("%d.%m %H:%M") if r["updated"] else ""
             if r["code"] == "scan" and r["msg_total"]:
                 pct = f"{min(100, r['msgs'] * 100 // r['msg_total'])}%"
@@ -4894,6 +5085,7 @@ class App:
                             values=(r["name"], r["status"], pct, "", "", files, size, msgs, upd, r["versions"] or ""))
             if r["code"] == "running":
                 self.ex_running_iid = iid
+                self.ex_running_want = r["want_bytes"]
             if (r["dir"] or r["name"]) in sel:
                 tv.selection_add(iid)
         if self._select_running and self.ex_running_iid:
@@ -4964,6 +5156,7 @@ class App:
         cfg = json.loads(json.dumps(cfg))
         cfg["all_skip_done"] = False
         self._begin_job()
+        self.last_job = ("all", cfg, chats, None)
         self.job = self.worker.submit(self.worker.export_all(cfg, chats))
 
     def ex_continue(self):
@@ -5083,6 +5276,145 @@ class App:
                 ("pass", "Пароль", self.v_ppass, 26, "•"))):
             self.proxy_rows[key] = self.field_row(pcol, 3 + i, label, var, width=width, show=show)
 
+        self.section(pcol, "Проверка связи", 9, top=24, colspan=2)
+        ttk.Label(pcol, text="Сравните варианты: проверьте с включённым VPN, потом выключите VPN, запустите прокси "
+                             "и проверьте снова. Покажу пинг и скорость скачивания и подскажу, где быстрее.",
+                  style="Muted.TLabel", wraplength=S(460), justify="left").grid(row=10, column=0, columnspan=2,
+                                                                                  sticky="w")
+        db = ttk.Frame(pcol)
+        db.grid(row=11, column=0, columnspan=2, sticky="w", pady=(S(10), S(8)))
+        self.b_diag = ttk.Button(db, text="Проверить подключение", command=self.on_diagnose)
+        self.b_diag.pack(side="left")
+        self.l_diag_note = ttk.Label(db, text="", style="Small.TLabel", wraplength=S(300), justify="left")
+        self.l_diag_note.pack(side="left", padx=(S(12), 0))
+        fnt = self.ui.f_body
+
+        def W(sample):
+            return fnt.measure(sample) + S(22)
+        dbox, self.diag_tv = self.make_tree(pcol, (
+            ("when", "Когда", W("23:59"), "w", False), ("var", "Вариант", W("MTProto 127.0.0.1:1443"), "w", False),
+            ("ping", "Пинг", W("9999 мс"), "e", False), ("speed", "Скорость", W("99.9 МБ/с"), "e", False),
+            ("res", "Итог", W("не подключилось"), "w", False)), selectmode="browse", height=4, key="diag")
+        dbox.grid(row=12, column=0, columnspan=2, sticky="ew")
+        bb = ttk.Frame(pcol)
+        bb.grid(row=13, column=0, columnspan=2, sticky="w", pady=(S(8), 0))
+        self.l_diag_best = ttk.Label(bb, text="", style="Success.TLabel", wraplength=S(420), justify="left")
+        self.l_diag_best.pack(side="left")
+        self.b_diag_use = ttk.Button(bb, text="Выбрать этот вариант", style="Link.TButton", command=self.use_best)
+        self.diag_rows = {}
+        self.diag_best = None
+
+    def fill_from_link(self):
+        """Ссылка tg://proxy?server=…&port=…&secret=… (или https://t.me/proxy?…) → поля сервер, порт, секрет."""
+        link = self.v_plink.get().strip()
+        if not link:
+            return
+        try:
+            q = parse_qs(urlparse(link.replace("tg://proxy?", "https://t.me/proxy?")).query)
+        except Exception:
+            return
+        for key, var in (("server", self.v_phost), ("port", self.v_pport), ("secret", self.v_psecret)):
+            val = (q.get(key) or [""])[0].strip()
+            if val and var.get() != val:
+                var.set(val)
+        if q.get("server") and self.v_ptype.get() != "mtproto" and (q.get("secret") or [""])[0]:
+            self.v_ptype.set("mtproto")
+            self.update_proxy_state()
+
+    def diag_variants(self, cfg):
+        """Что проверять: без прокси (напрямую или через VPN) и настроенные прокси."""
+        out = [("Без прокси / VPN", "", dict(cfg, proxy_type=""))]
+        if cfg.get("proxy_link") or cfg.get("proxy_secret"):
+            out.append((f"MTProto {cfg.get('proxy_host')}:{cfg.get('proxy_port')}", "mtproto",
+                        dict(cfg, proxy_type="mtproto")))
+        if cfg.get("proxy_type") == "socks5" or cfg.get("proxy_user"):
+            out.append((f"SOCKS5 {cfg.get('proxy_host')}:{cfg.get('proxy_port')}", "socks5",
+                        dict(cfg, proxy_type="socks5")))
+        return out
+
+    def on_diagnose(self):
+        try:
+            cfg = self.collect_cfg()
+            int(cfg["api_id"])
+            if not cfg["api_hash"]:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Нужны API ID и API hash", "Для проверки связи заполните API ID и API hash.",
+                                   parent=self.root)
+            return
+        variants = self.diag_variants(cfg)
+        self.diag_kind = {label: kind for label, kind, _ in variants}
+        self.b_diag.configure(state="disabled")
+        self.l_diag_note.configure(text="Проверяю… это займёт до полуминуты на вариант.")
+        chats = [c for c in [self.v_chat.get().strip()] if c] + [str(d[0]) for d in self.dialogs[:8]]
+        coro = self.worker.diagnose([(label, c) for label, _, c in variants], chats)
+
+        async def safe():
+            try:
+                await coro
+            except Exception as e:
+                self.q.put(("diag_note", f"Проверка не удалась: {e}"))
+                self.q.put(("diag_done",))
+        asyncio.run_coroutine_threadsafe(safe(), self.worker.loop)
+
+    def on_diag_event(self, item):
+        kind = item[0]
+        if kind == "diag_note":
+            self.l_diag_note.configure(text=item[1])
+            return
+        if kind == "diag_done":
+            self.b_diag.configure(state="normal")
+            if not self.l_diag_note.cget("text").startswith("Проверка не"):
+                self.l_diag_note.configure(text="Готово. Можно переключить VPN/прокси и проверить ещё раз.")
+            self.pick_best()
+            return
+        _, label, state, res = item
+        tv = self.diag_tv
+        if state == "running":
+            iid = f"{label}|{time.time()}"
+            self.diag_rows[label] = iid
+            tv.insert("", 0, iid=iid, values=(time.strftime("%H:%M"), label, "", "", "проверяю…"))
+            return
+        iid = self.diag_rows.get(label)
+        if not iid or not tv.exists(iid):
+            return
+        ping = f"{res['ping']:.0f} мс" if res.get("ping") is not None else "—"
+        speed = f"{human(res['speed'])}/с" if res.get("speed") else ("—" if res.get("ok") else "")
+        verdict = "работает" if res.get("ok") else "не подключилось"
+        tv.item(iid, values=(time.strftime("%H:%M"), label, ping, speed, verdict),
+                tags=(() if res.get("ok") else ("failed",)))
+        res["kind"] = getattr(self, "diag_kind", {}).get(label, "")
+        res["when"] = time.strftime("%H:%M")
+        self.diag_results = [r for r in getattr(self, "diag_results", []) if r["iid"] != iid] + [dict(res, iid=iid)]
+
+    def pick_best(self):
+        ok = [r for r in getattr(self, "diag_results", []) if r.get("ok")]
+        if not ok:
+            self.l_diag_best.configure(text="Ни один вариант не подключился — проверьте интернет, VPN или прокси.",
+                                       style="Danger.TLabel")
+            self.b_diag_use.pack_forget()
+            return
+        with_speed = [r for r in ok if r.get("speed")]
+        best = max(with_speed, key=lambda r: r["speed"]) if with_speed else min(ok, key=lambda r: r["ping"] or 1e9)
+        self.diag_best = best
+        what = f"{human(best['speed'])}/с, пинг {best['ping']:.0f} мс" if best.get("speed") else \
+            f"пинг {best['ping']:.0f} мс"
+        self.l_diag_best.configure(text=f"Быстрее всего: {best['label']} ({best['when']}) — {what}",
+                                   style="Success.TLabel")
+        if best.get("kind") != self.v_ptype.get():
+            self.b_diag_use.pack(side="left", padx=(self.S(8), 0))
+        else:
+            self.b_diag_use.pack_forget()
+
+    def use_best(self):
+        if self.diag_best:
+            self.v_ptype.set(self.diag_best.get("kind", ""))
+            self.update_proxy_state()
+            self.save_cfg()
+            self.b_diag_use.pack_forget()
+            self.l_diag_note.configure(text="Вариант выбран. Нажмите «Подключиться»/«Переподключиться», "
+                                            "чтобы применить его.")
+
     def toggle_hash(self):
         hidden = str(self.e_hash.cget("show")) != ""
         self.e_hash.configure(show="" if hidden else "•")
@@ -5131,8 +5463,9 @@ class App:
         self.l_acc_name.configure(text=name)
         self.l_conn_status.configure(text=status, style="Value.TLabel")
         self.l_conn_hint.configure(text=hint, style="Muted.TLabel")
+        exporting = self.busy and self.stoppable and not self.connecting
         self.b_connect.configure(text="Переподключиться" if self.account else "Подключиться",
-                                 state="disabled" if self.busy else "normal")
+                                 state="normal" if (not self.busy or exporting) else "disabled")
         can_logout = (self.account or os.path.exists(SESSION_PATH + ".session")) and not self.busy
         self.b_logout.configure(state="normal" if can_logout else "disabled")
         if self.connecting and self.busy:
@@ -5160,8 +5493,6 @@ class App:
         ttk.Checkbutton(ff, text="HTML — для просмотра в браузере", variable=self.v_html).pack(side="left")
         ttk.Checkbutton(ff, text="JSON — формат Telegram Desktop", variable=self.v_json).pack(
             side="left", padx=(S(20), 0))
-        ttk.Checkbutton(col, text="Начинать скачивание файлов сразу после сканирования, без вопроса",
-                        variable=self.v_auto).grid(row=3, column=1, columnspan=2, sticky="w", pady=S(4))
 
         self.section(col, "Скорость и надёжность", 4, top=28, colspan=3)
         for i, (label, var, lo, hi, tip) in enumerate((
@@ -5354,7 +5685,8 @@ class App:
             proxy_secret=self.v_psecret.get().strip(), proxy_user=self.v_puser.get().strip(),
             proxy_pass=self.v_ppass.get(),
             types={k: v.get() for k, v in self.v_types.items()},
-            size_limit_mb=int(self.v_limit.get()), out_root=self.v_out.get().strip(),
+            size_limit_mb=0 if self.v_unlimited.get() else max(1, min(4096, int(self.v_limit.get()))),
+            out_root=self.v_out.get().strip(),
             parallel=int(self.v_parallel.get()), threads_per_file=int(self.v_threads.get()),
             stall_timeout=int(self.v_stall.get()),
             retries=int(self.v_retries.get()), make_html=self.v_html.get(), make_json=self.v_json.get(),
@@ -5382,7 +5714,8 @@ class App:
 
     def bad_number_setting(self):
         """Проверка числовых полей настроек — понятное сообщение вместо падения."""
-        for var, name in ((self.v_parallel, "Файлов одновременно"), (self.v_threads, "Потоков на большой файл"),
+        for var, name in ((self.v_limit, "Максимальный размер файла"),
+                          (self.v_parallel, "Файлов одновременно"), (self.v_threads, "Потоков на большой файл"),
                           (self.v_stall, "Зависшим считать через"), (self.v_retries, "Повторов перед пропуском")):
             try:
                 int(var.get())
@@ -5418,6 +5751,15 @@ class App:
         self.refresh_exports()
 
     def on_connect(self):
+        if self.busy and self.stoppable and not self.connecting:
+            # идёт экспорт: приостановить, переподключиться с новыми настройками и продолжить с того же места
+            if not messagebox.askyesno(
+                    "Переподключиться?", "Экспорт ненадолго приостановится: программа переподключится с текущими "
+                    "настройками и продолжит с того же места.\n\nПродолжить?", parent=self.root):
+                return
+            self._reconnect_after_stop = True
+            self.on_stop()
+            return
         if self.busy:
             return
         try:
@@ -5478,6 +5820,7 @@ class App:
             cfg2 = json.loads(json.dumps(cfg))
             cfg2["all_skip_done"] = False
             self._begin_job()
+            self.last_job = ("all", cfg2, chats, None)
             self.job = self.worker.submit(self.worker.export_all(cfg2, chats))
             return
         if len(self.checked) == 1:
@@ -5497,6 +5840,7 @@ class App:
                 "Уже скачанные файлы повторно не качаются.\n\nПродолжить?", parent=self.root):
             return
         self._begin_job()
+        self.last_job = ("single", json.loads(json.dumps(cfg)), str(chat), version)
         self.job = self.worker.submit(self.worker.export_auto(json.loads(json.dumps(cfg)), str(chat),
                                                               version=version))
 
@@ -5552,9 +5896,10 @@ class App:
             if not chats:
                 return
             d.destroy()
-            cfg2 = self.collect_cfg()
+            cfg2 = json.loads(json.dumps(self.collect_cfg()))
             self._begin_job()
-            self.job = self.worker.submit(self.worker.export_all(json.loads(json.dumps(cfg2)), list(chats)))
+            self.last_job = ("all", cfg2, list(chats), None)
+            self.job = self.worker.submit(self.worker.export_all(cfg2, list(chats)))
 
         ttk.Button(btns, text="Отмена", command=d.destroy).pack(side="right")
         b_go = ttk.Button(btns, text="Начать экспорт", style="Accent.TButton", command=go)
@@ -5571,6 +5916,19 @@ class App:
             except tk.TclError:
                 pass
 
+    def relaunch_last_job(self):
+        """После переподключения продолжаем тот же экспорт с места остановки."""
+        kind, cfg, target, version = self.last_job
+        cfg = dict(cfg, **{k: self.cfg[k] for k in ("proxy_type", "proxy_link", "proxy_host", "proxy_port",
+                                                    "proxy_secret", "proxy_user", "proxy_pass")})
+        self.log("▶ Продолжаю экспорт после переподключения.")
+        self._begin_job()
+        if kind == "single":
+            self.job = self.worker.submit(self.worker.export_auto(cfg, target,
+                                                                  version=None if version == "full" else version))
+        else:
+            self.job = self.worker.submit(self.worker.export_all(cfg, target))
+
     def on_stop(self):
         if self.job and not self.job.done():
             self.set_phase("Останавливаю…")
@@ -5578,6 +5936,12 @@ class App:
 
     # ---------- галочки в списке чатов ----------
     def on_chat_click(self, e):
+        if self.tv.identify_region(e.x, e.y) == "cell" and self.tv.identify_column(e.x) == "#3":
+            iid = self.tv.identify_row(e.y)          # клик по «посчитать» — узнать число сообщений этого чата
+            if iid and iid not in self.counts:
+                self.counts[iid] = "?"
+                self.tv.set(iid, "msgs", "считаю…")
+                self.worker.request_count(iid)
         if self.tv.identify_region(e.x, e.y) == "tree":      # клик по квадратику — отметить, не выделяя
             iid = self.tv.identify_row(e.y)
             if iid:
@@ -5633,20 +5997,112 @@ class App:
             self.v_chat.set(txt)
 
     def show_count(self, chat):
+        if self.tv.exists(chat):
+            self.tv.set(chat, "msgs", self.count_text(chat))
         if chat == self.v_chat.get():
             self.update_chat_header()
+        if not getattr(self, "_counts_save_pending", False):     # сохраняем не чаще раза в 5 с
+            self._counts_save_pending = True
+
+            def later():
+                self._counts_save_pending = False
+                self.save_counts()
+            self.root.after(5000, later)
+
+    def count_text(self, iid):
+        n = self.counts.get(iid, "")
+        if n == "":
+            return "посчитать"
+        if n == "?":
+            return "считаю…"
+        if n is None:
+            return "—"
+        return f"{n:,}".replace(",", " ")
+
+    def sort_chats(self, col):
+        cur, rev = self.chat_sort
+        self.chat_sort = (col, not rev if cur == col else (col == "msgs"))
+        for c, t in (("name", "Чат"), ("kind", "Тип"), ("msgs", "Сообщений")):
+            mark = (" ▼" if self.chat_sort[1] else " ▲") if c == col else ""
+            self.tv.heading(c, text=t + mark)
+        self.fill_dialogs()
+
+    def sorted_dialogs(self):
+        col, rev = self.chat_sort
+        if not col:
+            return self.dialogs
+        if col == "name":
+            key = lambda d: d[1].lower()
+        elif col == "kind":
+            key = lambda d: (d[2], d[1].lower())
+        else:
+            key = lambda d: (self.counts.get(str(d[0])) if isinstance(self.counts.get(str(d[0])), int) else -1)
+        return sorted(self.dialogs, key=key, reverse=rev)
+
+    def count_all(self):
+        """Сообщений во всех чатах списка — по одному запросу на чат, с прогрессом."""
+        if not self.worker.client:
+            messagebox.showinfo("Нужно подключение", "Сначала подключитесь к Telegram.", parent=self.root)
+            return
+        ids = [str(d[0]) for d in self.dialogs if not isinstance(self.counts.get(str(d[0])), int)]
+        if not ids:
+            return
+        mins = max(1, round(len(ids) * 0.4 / 60))
+        if len(ids) > 30 and not messagebox.askyesno(
+                "Посчитать сообщения", f"Нужно посчитать {len(ids)} чатов — это {len(ids)} запросов к Telegram, "
+                f"примерно {mins} мин. (Telegram может просить паузы.)\n\nМожно продолжать работу, "
+                "подсчёт идёт в фоне и его можно остановить.\n\nНачать?", parent=self.root):
+            return
+        for i in ids:
+            self.counts[i] = "?"
+        self.fill_dialogs()
+        self.pb_count.configure(maximum=len(ids), value=0)
+        self.l_count_prog.configure(text=f"Считаю сообщения: 0 из {len(ids)}")
+        self.count_bar.grid()
+        self.b_count_all.configure(state="disabled")
+        asyncio.run_coroutine_threadsafe(self.worker.count_many(ids), self.worker.loop)
+
+    def stop_counting(self):
+        self.worker.count_stop = True
+
+    def on_count_progress(self, i, n):
+        self.pb_count.configure(maximum=max(1, n), value=i)
+        self.l_count_prog.configure(text=f"Считаю сообщения: {i} из {n}")
+        if i >= n or getattr(self.worker, "count_stop", False):
+            self.count_bar.grid_remove()
+            self.b_count_all.configure(state="normal")
+            for k in [k for k, v in self.counts.items() if v == "?"]:
+                del self.counts[k]
+            self.fill_dialogs()
+            self.save_counts()
+
+    COUNTS_PATH = os.path.join(APP_DIR, "chat_counts.json")
+
+    def load_counts(self):
+        try:
+            with open(self.COUNTS_PATH, encoding="utf-8") as f:
+                self.counts.update({k: v for k, v in json.load(f).items() if isinstance(v, int)})
+        except Exception:
+            pass
+
+    def save_counts(self):
+        try:
+            with open(self.COUNTS_PATH, "w", encoding="utf-8") as f:
+                json.dump({k: v for k, v in self.counts.items() if isinstance(v, int)}, f)
+        except Exception:
+            pass
 
     def fill_dialogs(self):
         s = self.v_search.get().lower().strip()
         tv = self.tv
         tv.delete(*tv.get_children())
         cur = self.v_chat.get()
-        for did, name, kind in self.dialogs:
+        for did, name, kind in self.sorted_dialogs():
             if not s or s in name.lower() or s in str(did):
                 iid = str(did)
                 if tv.exists(iid):
                     continue
-                tv.insert("", "end", iid=iid, values=(name, kind),
+                tv.insert("", "end", iid=iid, values=(name, kind, self.count_text(iid)),
                           image=self.ui.tree_cb["on" if iid in self.checked else "off"])
                 if iid == cur:
                     tv.selection_set(iid)
@@ -5931,6 +6387,10 @@ class App:
                     self.dialog_map = {}
                     self.fill_dialogs()
                     self.update_account()
+                elif kind in ("diag", "diag_note", "diag_done"):
+                    self.on_diag_event(item)
+                elif kind == "count_progress":
+                    self.on_count_progress(item[1], item[2])
                 elif kind == "chat_count":
                     self.counts[item[1]] = item[2]
                     self.show_count(item[1])
@@ -5971,8 +6431,17 @@ class App:
                     self.update_activity()
                     self.show_report(item[2])
                 elif kind == "idle":
+                    was_connecting = self.connecting
                     self.connecting = False
                     self.set_busy(False)
+                    if getattr(self, "_reconnect_after_stop", False):
+                        self._reconnect_after_stop = False
+                        self._relaunch_after_connect = True
+                        self.root.after(300, self.on_connect)
+                    elif was_connecting and getattr(self, "_relaunch_after_connect", False):
+                        self._relaunch_after_connect = False
+                        if self.account and getattr(self, "last_job", None):
+                            self.root.after(300, self.relaunch_last_job)
                     self.update_chat_empty()
                     if self.page == "exports":
                         self.refresh_exports()
@@ -6053,6 +6522,9 @@ class App:
             self.stat["speed"].configure(text=f"{human(cur)}/с · ср. {human(avg)}/с" if avg else "пауза…")
             live.update(status="Идёт: скачивание", pct=f"{pct * 100:.0f}%",
                         speed=f"{human(cur)}/с" if cur else "пауза")
+            want = getattr(self, "ex_running_want", 0) or 0
+            if want >= p.total:                       # всего по чату = уже скачанное раньше + в этом запуске
+                live["size"] = f"{human(want - p.total + p.n)} из {human(want)}"
             if avg > 0 and p.total > p.n:
                 left = (p.total - p.n) / avg
                 self.dl_eta = left
@@ -6128,6 +6600,7 @@ class App:
                 "места.", parent=self.root):
             return
         self.save_cfg()
+        self.save_counts()
         if self.job and not self.job.done():
             self.job.cancel()
         try:
