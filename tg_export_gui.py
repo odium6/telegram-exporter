@@ -5044,15 +5044,18 @@ class App:
         self.l_conn_status.grid(row=1, column=0, columnspan=2, sticky="w")
         self.l_conn_hint = ttk.Label(col, text="", style="Muted.TLabel", wraplength=S(420), justify="left")
         self.l_conn_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(S(2), 0))
-        bf = ttk.Frame(col)
-        bf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(S(12), 0))
+        holder = ttk.Frame(col)
+        holder.grid(row=3, column=0, columnspan=2, sticky="w", pady=(S(12), 0))
+        bf = ttk.Frame(holder)
+        bf.pack(side="top", anchor="w")
         self.b_connect = ttk.Button(bf, text="Подключиться", style="Accent.TButton", command=self.on_connect)
         self.b_connect.pack(side="left")
         self.b_logout = ttk.Button(bf, text="Выйти из аккаунта", command=self.on_logout)
         self.b_logout.pack(side="left", padx=(S(8), 0))
         self.b_conn_cancel = ttk.Button(bf, text="Отмена", command=self.on_stop)
-        self.l_conn_phase = ttk.Label(bf, text="", style="Small.TLabel")
-        self.l_conn_phase.pack(side="right", padx=(S(12), 0))
+        # ход подключения — отдельной строкой под кнопками, с переносом: длинный текст не раздвигает колонку
+        self.l_conn_phase = ttk.Label(holder, text="", style="Small.TLabel", wraplength=S(420), justify="left")
+        self.l_conn_phase.pack(side="top", anchor="w", pady=(S(8), 0))
 
         self.section(col, "Telegram API", 4, top=24, colspan=2)
         self.field_row(col, 5, "API ID", self.v_api_id, width=20)
@@ -5230,7 +5233,7 @@ class App:
     def set_phase(self, text):
         self.l_phase.configure(text=text)
         if self.connecting and hasattr(self, "l_conn_phase"):
-            self.l_conn_phase.configure(text=text)
+            self.l_conn_phase.configure(text=text.split(" — ")[0])
 
     def update_activity(self):
         """Прогресс и показатели видны только во время работы или после неё — без пустых «—» в покое."""
