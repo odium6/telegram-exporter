@@ -63,6 +63,8 @@ DEFAULTS = {
     "col_widths": {},           # ширина колонок таблиц, которую выставил пользователь
     "multi_mode": "sequential", # несколько чатов: по очереди / сначала сканировать все
     "language": "system",       # ru / en / system
+    "takeout": {},              # режим экспорта Telegram: последнее известное состояние
+    "takeout_hidden": "",       # какое состояние плашки пользователь скрыл
 }
 
 KIND_NAMES = {
@@ -2757,6 +2759,7 @@ class Worker:
                                       channels=True, files=True,
                                       max_file_size=(int(cfg["size_limit_mb"]) or 4096) * 1024 * 1024)
             self.hist = await stack.enter_async_context(tk_)
+            self.q.put(("takeout", {"status": "on", "checked": time.time()}))
             self.log("⚡ Включён режим экспорта Telegram: меньше пауз при чтении истории. "
                      "На других ваших устройствах Telegram может показать уведомление о запросе экспорта — это он.")
         except Exception as e:
@@ -2765,11 +2768,27 @@ class Worker:
             if cname(e) == "TakeoutInitDelayError" and secs:
                 import datetime as _dt
                 when = _dt.datetime.now() + _dt.timedelta(seconds=secs)
+                self.q.put(("takeout", {"status": "delayed", "until": time.time() + secs, "checked": time.time()}))
                 self.log(f"ℹ Режим экспорта Telegram пока недоступен: в целях безопасности Telegram разрешит его "
                          f"с {when:%d.%m.%Y %H:%M} (обычно через сутки после входа на новом устройстве). "
                          "Экспорт идёт в обычном режиме — Telegram будет делать короткие паузы каждые ~3000 сообщений.")
             else:
+                self.q.put(("takeout", {"status": "failed", "error": str(e)[:200], "checked": time.time()}))
                 self.log(f"ℹ Режим экспорта Telegram не включился ({e}). Экспорт идёт в обычном режиме.")
+
+    async def check_takeout(self, cfg):
+        """«Проверить сейчас»: открыть режим экспорта и сразу закрыть — узнать, разрешил ли его Telegram."""
+        from contextlib import AsyncExitStack
+        stack = AsyncExitStack()
+        try:
+            await self._open_takeout(stack, dict(cfg, use_takeout=True))
+        finally:
+            self.hist = None
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+            self.q.put(("takeout_checked",))
 
     async def _export_loop(self, cfg, chat, report_window=True, max_attempts=100, confirm=True, version=None,
                            **kw):
@@ -4324,6 +4343,33 @@ EN_RE.extend([
     (_R(r"([^:\s][^:]*): (\d+)"), lambda m: f"{tr(m.group(1))}: {m.group(2)}"),
 ])
 
+EN.update({
+    "Режим экспорта Telegram": "Telegram export mode", "Подробнее": "Details", "Подробнее…": "Details…", "Скрыть": "Hide",
+    "Проверить сейчас": "Check now", "Проверяю…": "Checking…",
+    "⚡ Режим экспорта Telegram включён — при сканировании истории меньше пауз.":
+        "⚡ Telegram export mode is on — fewer pauses while scanning history.",
+    "✅ Срок ожидания режима экспорта Telegram прошёл — он включится сам при следующем экспорте. Можно проверить сейчас.":
+        "✅ The waiting period for Telegram export mode is over — it turns on by itself with the next export. You can check now.",
+    "Режим экспорта Telegram ещё не проверялся — программа попробует включить его при первом экспорте.":
+        "Telegram export mode hasn't been checked yet — the program will try to turn it on with the first export.",
+    "Плашку можно вернуть: сведения о режиме экспорта — на странице «Подключение».":
+        "The notice is hidden: export mode details are always on the «Connection» page.",
+    "Это тот же режим, которым пользуется Telegram Desktop при «Экспорте данных». В нём Telegram мягче ограничивает частоту запросов, поэтому при чтении истории (сканировании) меньше пауз.":
+        "This is the same mode Telegram Desktop uses for «Export data». In it Telegram limits request rate less strictly, so there are fewer pauses while reading (scanning) history.",
+    "Когда программа впервые просит этот режим, Telegram в целях безопасности откладывает его примерно на сутки после входа на новом устройстве и присылает на ваши другие устройства уведомление о запросе экспорта. Это запрос этой программы — подтверждение в Telegram и есть то самое разрешение.":
+        "When the program first asks for this mode, Telegram, for security, delays it for about a day after logging in on a new device and sends an export request notification to your other devices. That's this program's request — confirming it in Telegram is the permission.",
+    "Программа сама включает режим при каждом запуске экспорта. Пока Telegram его не разрешил, экспорт идёт в обычном режиме — ничего делать не нужно.":
+        "The program turns the mode on by itself every time an export starts. Until Telegram allows it, the export runs in normal mode — nothing to do.",
+    "На скорость скачивания файлов режим не влияет — только на паузы при сканировании истории.":
+        "The mode doesn't affect file download speed — only the pauses while scanning history.",
+})
+EN_RE.extend([
+    (_R(r"ℹ Режим экспорта Telegram станет доступен (.+)\. До этого экспорт идёт в обычном режиме \(Telegram делает короткие паузы при сканировании\)\."),
+     r"ℹ Telegram export mode becomes available on \1. Until then the export runs in normal mode (Telegram makes short pauses while scanning)."),
+    (_R(r"ℹ Режим экспорта Telegram не включился: (.*)\. Экспорт идёт в обычном режиме\."),
+     r"ℹ Telegram export mode didn't turn on: \1. Exporting in normal mode."),
+])
+
 
 def _literal_len(rx):
     return len(re.sub(r"\(.*?\)|\\.|[.+*?\[\]^$|{}]", "", rx.pattern))
@@ -4798,6 +4844,7 @@ class App:
         self.update_account()
         self.fill_dialogs()
         self.update_activity()
+        self.update_takeout_ui()
         self.root.after(200, self.poll)
         self.root.after(1000, self.tick)
         self.root.after(80, lambda: set_titlebar_theme(self.root, self.ui.mode == "dark"))
@@ -5078,6 +5125,7 @@ class App:
     def _build_export_page(self):
         S = self.S
         body, actions, sub = self._page("export", "Экспорт")
+        self._build_takeout_notice(actions.master)
         self.b_all = ttk.Button(actions, text="Экспорт всех чатов…", command=self.on_start_all)
         self.b_all.pack(side="right")
         self.b_uncheck = ttk.Button(actions, text="Снять отметки", style="Link.TButton",
@@ -5195,6 +5243,119 @@ class App:
         st = "disabled" if self.v_unlimited.get() else "normal"
         self.sp_limit.configure(state=st)
         self.sc_limit.state(["disabled"] if self.v_unlimited.get() else ["!disabled"])
+
+    # ---------- режим экспорта Telegram (разрешение на экспорт) ----------
+    def _build_takeout_notice(self, head):
+        """Плашка о режиме экспорта: её можно скрыть, но сведения всегда есть в «Подключении»."""
+        S = self.S
+        f = tk.Frame(head, bd=0, highlightthickness=1)
+        self.theme_tk(f, lambda c, w=f: w.configure(bg=c["accent_soft"], highlightbackground=c["accent_soft"],
+                                                    highlightcolor=c["accent_soft"]))
+        f.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(S(12), 0))
+        f.columnconfigure(0, weight=1)
+        self.tko_label = tk.Label(f, text="", anchor="w", justify="left", font=self.ui.f_body, bd=0)
+        self.theme_tk(self.tko_label, lambda c, w=self.tko_label: w.configure(bg=c["accent_soft"], fg=c["text"]))
+        self.tko_label.grid(row=0, column=0, sticky="ew", padx=(S(12), S(8)), pady=S(8))
+        f.bind("<Configure>", lambda e: self.tko_label.configure(wraplength=max(S(300), e.width - S(240))))
+        links = []
+        for col, text, cmd in ((1, "Подробнее", self.show_takeout_info), (2, "Скрыть", self.hide_takeout_notice)):
+            l = tk.Label(f, text=text, cursor="hand2", font=self.ui.f_body, bd=0)
+            self.theme_tk(l, lambda c, w=l: w.configure(bg=c["accent_soft"], fg=c["accent"]))
+            l.grid(row=0, column=col, sticky="e", padx=(S(4), S(12) if col == 2 else S(8)))
+            l.bind("<Button-1>", lambda e, c=cmd: c())
+            links.append(l)
+        self.tko_notice = f
+        f.grid_remove()
+
+    def takeout_state(self):
+        st = dict(self.cfg.get("takeout") or {})
+        if st.get("status") == "delayed" and st.get("until", 0) <= time.time():
+            st["status"] = "ready"            # срок прошёл — включится при следующем экспорте
+        return st
+
+    def takeout_text(self, short=False):
+        import datetime as _dt
+        st = self.takeout_state()
+        s = st.get("status")
+        if s == "on":
+            return "⚡ Режим экспорта Telegram включён — при сканировании истории меньше пауз."
+        if s == "delayed":
+            when = _dt.datetime.fromtimestamp(st["until"]).strftime("%d.%m.%Y %H:%M")
+            return (f"ℹ Режим экспорта Telegram станет доступен {when}. До этого экспорт идёт в обычном режиме "
+                    "(Telegram делает короткие паузы при сканировании).")
+        if s == "ready":
+            return ("✅ Срок ожидания режима экспорта Telegram прошёл — он включится сам при следующем экспорте. "
+                    "Можно проверить сейчас.")
+        if s == "failed":
+            return f"ℹ Режим экспорта Telegram не включился: {st.get('error', '')}. Экспорт идёт в обычном режиме."
+        return "Режим экспорта Telegram ещё не проверялся — программа попробует включить его при первом экспорте."
+
+    def update_takeout_ui(self):
+        st = self.takeout_state()
+        sig = f"{st.get('status')}|{int(st.get('until', 0))}"
+        show = st.get("status") in ("on", "delayed", "ready", "failed") and self.cfg.get("takeout_hidden") != sig
+        self.tko_label.configure(text=self.takeout_text())
+        if show:
+            self.tko_notice.grid()
+        else:
+            self.tko_notice.grid_remove()
+        if hasattr(self, "l_tko_status"):
+            self.l_tko_status.configure(text=self.takeout_text())
+            ready = self.worker.client is not None and not self.busy
+            self.b_tko_check.configure(state="normal" if ready else "disabled")
+
+    def hide_takeout_notice(self):
+        st = self.takeout_state()
+        self.cfg["takeout_hidden"] = f"{st.get('status')}|{int(st.get('until', 0))}"
+        self.save_cfg()
+        self.update_takeout_ui()
+        self.set_phase("Плашку можно вернуть: сведения о режиме экспорта — на странице «Подключение».")
+
+    def on_takeout_event(self, state):
+        self.cfg["takeout"] = state
+        self.save_cfg()
+        self.update_takeout_ui()
+
+    def check_takeout(self):
+        if not self.worker.client or self.busy:
+            return
+        self.b_tko_check.configure(state="disabled")
+        self.l_tko_status.configure(text="Проверяю…")
+        cfg = json.loads(json.dumps(self.collect_cfg()))
+
+        async def run():
+            try:
+                await self.worker.check_takeout(cfg)
+            except Exception as e:
+                self.q.put(("takeout", {"status": "failed", "error": str(e)[:200], "checked": time.time()}))
+                self.q.put(("takeout_checked",))
+        asyncio.run_coroutine_threadsafe(run(), self.worker.loop)
+
+    def show_takeout_info(self):
+        S = self.S
+        d, body, btns = self._modal("Режим экспорта Telegram")
+        st = ttk.Label(body, text=self.takeout_text(), style="Value.TLabel", wraplength=S(520), justify="left")
+        st.pack(anchor="w")
+        for text in (
+                "Это тот же режим, которым пользуется Telegram Desktop при «Экспорте данных». В нём Telegram мягче "
+                "ограничивает частоту запросов, поэтому при чтении истории (сканировании) меньше пауз.",
+                "Когда программа впервые просит этот режим, Telegram в целях безопасности откладывает его примерно на "
+                "сутки после входа на новом устройстве и присылает на ваши другие устройства уведомление о запросе "
+                "экспорта. Это запрос этой программы — подтверждение в Telegram и есть то самое разрешение.",
+                "Программа сама включает режим при каждом запуске экспорта. Пока Telegram его не разрешил, экспорт "
+                "идёт в обычном режиме — ничего делать не нужно.",
+                "На скорость скачивания файлов режим не влияет — только на паузы при сканировании истории."):
+            ttk.Label(body, text=text, style="Muted.TLabel", wraplength=S(520), justify="left").pack(
+                anchor="w", pady=(S(10), 0))
+        ttk.Button(btns, text="Закрыть", command=d.destroy).pack(side="right")
+        if self.worker.client and not self.busy:
+            def check():
+                d.destroy()
+                self.show_page("conn")
+                self.check_takeout()
+            ttk.Button(btns, text="Проверить сейчас", command=check).pack(side="right", padx=(0, S(8)))
+        d.bind("<Escape>", lambda e: d.destroy())
+        self._show_modal(d)
 
     def update_dest(self):
         if not hasattr(self, "l_dest"):
@@ -5909,6 +6070,15 @@ class App:
         ttk.Button(hf, text="Где взять API ID и hash →", style="Link.TButton",
                    command=lambda: webbrowser.open("https://my.telegram.org/apps")).pack(side="left")
 
+        self.section(col, "Режим экспорта Telegram", 8, top=24, colspan=2)
+        self.l_tko_status = ttk.Label(col, text="", style="Muted.TLabel", wraplength=S(420), justify="left")
+        self.l_tko_status.grid(row=9, column=0, columnspan=2, sticky="w")
+        tb = ttk.Frame(col)
+        tb.grid(row=10, column=0, columnspan=2, sticky="w", pady=(S(8), 0))
+        ttk.Button(tb, text="Подробнее…", command=self.show_takeout_info).pack(side="left")
+        self.b_tko_check = ttk.Button(tb, text="Проверить сейчас", command=self.check_takeout)
+        self.b_tko_check.pack(side="left", padx=(S(8), 0))
+
         self.section(pcol, "Прокси", 0, top=0, colspan=2)
         Segmented(pcol, self.v_ptype, [("", "Без прокси"), ("mtproto", "MTProto (tg-ws-proxy)"),
                                        ("socks5", "SOCKS5")], command=self.update_proxy_state,
@@ -6396,6 +6566,8 @@ class App:
     # ---------- состояние «занято» ----------
     def set_busy(self, busy, stoppable=False):
         self.busy = busy
+        if hasattr(self, "b_tko_check"):
+            self.root.after_idle(self.update_takeout_ui)
         self.stoppable = busy and stoppable
         state = "disabled" if busy else "normal"
         self.b_start.configure(state=state)
@@ -7048,12 +7220,17 @@ class App:
                 elif kind == "logged_in":
                     self.account = item[1]
                     self.update_account()
+                    self.update_takeout_ui()
                 elif kind == "logged_out":
                     self.account = None
                     self.dialogs = []
                     self.dialog_map = {}
                     self.fill_dialogs()
                     self.update_account()
+                elif kind == "takeout":
+                    self.on_takeout_event(item[1])
+                elif kind == "takeout_checked":
+                    self.update_takeout_ui()
                 elif kind in ("diag", "diag_note", "diag_done"):
                     self.on_diag_event(item)
                 elif kind == "count_progress":
