@@ -62,6 +62,7 @@ DEFAULTS = {
     "graph_period": "300",
     "col_widths": {},           # ширина колонок таблиц, которую выставил пользователь
     "multi_mode": "sequential", # несколько чатов: по очереди / сначала сканировать все
+    "language": "system",       # ru / en / system
 }
 
 KIND_NAMES = {
@@ -3692,6 +3693,645 @@ def open_path(path):
         messagebox.showerror("Ошибка", str(e))
 
 
+# =================================== язык ===================================
+# Весь текст окна проходит через tr(): надписи и кнопки (через перехват настроек Tk), таблицы, заголовки окон,
+# сообщения, журнал и статусы. Русский — исходный язык; английский — словарь точных фраз + шаблоны для фраз
+# с числами и именами. Имена чатов и прочие данные не переводятся.
+
+LANG = "ru"
+_TR_CACHE = {}
+_REC = os.environ.get("TG_I18N_RECORD")
+_CYR = re.compile("[А-Яа-яЁё]")
+
+
+def system_lang():
+    """Язык Windows: русский (и близкие: украинский, белорусский, казахский) или английский."""
+    try:
+        import ctypes
+        lid = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF
+        return "ru" if lid in (0x19, 0x22, 0x23, 0x3F) else "en"
+    except Exception:
+        import locale
+        loc = (locale.getlocale()[0] or "").lower()
+        return "ru" if loc.startswith(("ru", "russian", "uk", "be", "kk")) else "en"
+
+
+def set_language(choice):
+    global LANG
+    LANG = system_lang() if choice in (None, "", "system") else choice
+    if LANG not in ("ru", "en"):
+        LANG = "en"
+    _TR_CACHE.clear()
+
+
+def tr(text):
+    if not isinstance(text, str) or not text:
+        return text
+    if _REC:
+        try:
+            with open(_REC, "a", encoding="utf-8") as f:
+                f.write(json.dumps(text, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    if LANG == "ru" or not _CYR.search(text):
+        return text
+    hit = _TR_CACHE.get(text)
+    if hit is not None:
+        return hit
+    out = EN.get(text)
+    if out is None:
+        stripped = text.strip()
+        if stripped != text and stripped in EN:
+            out = text.replace(stripped, EN[stripped])
+        elif "\n" in text:
+            out = "\n".join(tr(line) for line in text.split("\n"))
+        else:
+            out = _tr_pattern(text)
+    if len(_TR_CACHE) > 20000:
+        _TR_CACHE.clear()
+    _TR_CACHE[text] = out
+    return out
+
+
+def _tr_pattern(text):
+    for rx, rep in EN_RE:                 # сначала шаблоны для всей строки (в т. ч. со значком в начале)
+        mm = rx.fullmatch(text)
+        if mm:
+            return _tr_units(rep(mm) if callable(rep) else mm.expand(rep))
+    # ведущие значки (⏸ ✅ ⚠ 📡 …) и отступы сохраняем, переводим остальное
+    m = re.match(r"^([^\wА-Яа-яЁё«(\"'№~\-−+]+)(.*)$", text, re.S)
+    if m and m.group(2) and m.group(2) != text:
+        inner = tr(m.group(2))
+        if inner != m.group(2):
+            return m.group(1) + inner
+    return _tr_units(text)
+
+
+_UNITS = (("ТБ", "TB"), ("ГБ", "GB"), ("МБ", "MB"), ("КБ", "KB"), ("Б", "B"))
+
+
+def _tr_units(text):
+    """Единицы и короткие обозначения внутри чисел: «4.2 МБ/с», «~1 ч 2 мин», «12 с»."""
+    out = text
+    for ru, en in _UNITS:
+        out = re.sub(r"(\d) " + ru + r"(?![А-Яа-яЁё])", r"\1 " + en, out)
+    out = re.sub(r"(?<=[B\d])/с\b", "/s", out)
+    out = re.sub(r"(\d+) д (\d+) ч", r"\1 d \2 h", out)
+    out = re.sub(r"(\d+) ч (\d+) мин", r"\1 h \2 min", out)
+    out = re.sub(r"(\d+) ч\b", r"\1 h", out)
+    out = re.sub(r"(\d+) мин\b", r"\1 min", out)
+    out = re.sub(r"(\d+) с\b", r"\1 s", out)
+    out = re.sub(r"(\d+) мс\b", r"\1 ms", out)
+    out = out.replace("(сегодня)", "(today)").replace("(завтра)", "(tomorrow)")
+    return out
+
+
+def T(m, i):
+    """Перевести группу шаблона (для вложенных фраз)."""
+    return tr(m.group(i))
+
+
+def install_i18n():
+    """Перехват текста в Tk: надписи, кнопки, пункты меню, текст на холсте, заголовки окон, таблицы, сообщения."""
+    if getattr(tk.Misc, "_i18n", False):
+        return
+    tk.Misc._i18n = True
+    orig_options = tk.Misc._options
+
+    def _options(self, cnf, kw=None):
+        def fix(d):
+            if isinstance(d, dict) and any(k in d for k in ("text", "label")):
+                d = dict(d)
+                for k in ("text", "label"):
+                    if isinstance(d.get(k), str):
+                        d[k] = tr(d[k])
+            return d
+        return orig_options(self, fix(cnf), fix(kw))
+    tk.Misc._options = _options
+
+    orig_title = tk.Wm.wm_title
+
+    def wm_title(self, string=None):
+        return orig_title(self, tr(string) if isinstance(string, str) else string)
+    tk.Wm.wm_title = tk.Wm.title = wm_title
+
+    orig_heading = ttk.Treeview.heading
+
+    def heading(self, column, option=None, **kw):
+        if isinstance(kw.get("text"), str):
+            kw["text"] = tr(kw["text"])
+        return orig_heading(self, column, option, **kw)
+    ttk.Treeview.heading = heading
+
+    def fix_values(kw):
+        v = kw.get("values")
+        if isinstance(v, (list, tuple)):
+            kw["values"] = [tr(x) if isinstance(x, str) else x for x in v]
+        return kw
+    orig_insert, orig_item, orig_set = ttk.Treeview.insert, ttk.Treeview.item, ttk.Treeview.set
+
+    def insert(self, parent, index, iid=None, **kw):
+        return orig_insert(self, parent, index, iid, **fix_values(kw))
+
+    def item(self, item_, option=None, **kw):
+        return orig_item(self, item_, option, **fix_values(kw))
+
+    def set_(self, item_, column=None, value=None):
+        return orig_set(self, item_, column, tr(value) if isinstance(value, str) else value)
+    ttk.Treeview.insert, ttk.Treeview.item, ttk.Treeview.set = insert, item, set_
+
+    for name in ("showinfo", "showwarning", "showerror", "askyesno", "askokcancel", "askyesnocancel"):
+        f = getattr(messagebox, name, None)
+        if f is None:
+            continue
+
+        def wrap(f=f):
+            def g(title=None, message=None, **kw):
+                return f(tr(title) if isinstance(title, str) else title,
+                         tr(message) if isinstance(message, str) else message, **kw)
+            return g
+        setattr(messagebox, name, wrap())
+
+
+EN = {}      # точные фразы (заполняется ниже)
+EN_RE = []   # шаблоны (заполняется ниже)
+
+# ----------------------------- английский: точные фразы -----------------------------
+EN.update({
+    # навигация и общие
+    "Экспорт": "Export", "Мои экспорты": "My exports", "Подключение": "Connection", "Настройки": "Settings",
+    "Аккаунт": "Account", "Не подключено": "Not connected", "Подключение…": "Connecting…",
+    "Подключение...": "Connecting...", "Отмена": "Cancel", "Закрыть": "Close", "Копировать": "Copy",
+    "Скопировано": "Copied", "Продолжить?": "Continue?", "Готово": "Done", "Обзор…": "Browse…",
+    "Изменить": "Change", "Открыть": "Open", "Папку": "Folder", "Отчёт": "Report", "HTML": "HTML",
+    "Открыть папку": "Open folder", "Открыть HTML": "Open HTML", "Открыть список чатов": "Open chat list",
+    "Ошибка": "Error", "Папка": "Folder", "Журнал": "Log", "Язык": "Language",
+    # экспорт
+    "Экспорт всех чатов…": "Export all chats…", "Экспорт всех чатов": "Export all chats",
+    "Снять отметки": "Clear selection", "Посчитать сообщения": "Count messages", "Остановить": "Stop",
+    "Найти чат: название, ID, @username или ссылка t.me": "Find chat: name, ID, @username or t.me link",
+    "Чат": "Chat", "Тип": "Type", "Сообщений": "Messages", "Режим": "Mode", "Порядок": "Order",
+    "По очереди": "One by one", "Сначала сканировать все": "Scan all first",
+    "По очереди: скан → скачивание": "One by one: scan → download",
+    "Что скачивать": "What to download", "Фото": "Photos", "Видео": "Videos", "Голосовые": "Voice",
+    "Кружочки": "Video notes", "Стикеры": "Stickers", "GIF": "GIF", "Файлы": "Files",
+    "Голосовые сообщения": "Voice messages", "Видеосообщения (кружочки)": "Video messages (round)",
+    "Максимальный размер файла": "Maximum file size", "МБ": "MB", "Без ограничения": "No limit",
+    "После сканирования": "After scanning", "Сразу скачивать": "Download right away",
+    "Показать сводку": "Show summary", "Начать экспорт": "Start export",
+    "Чат не выбран": "No chat selected", "Выберите чат в списке слева.": "Select a chat in the list on the left.",
+    "Чат будет найден при запуске экспорта.": "The chat will be looked up when the export starts.",
+    "Продолжить с места остановки": "Continue where it stopped",
+    "Пересканировать всю историю заново": "Rescan the whole history",
+    "Новый экспорт: вся история": "New export: whole history",
+    "Список чатов пуст": "Chat list is empty",
+    "Подключитесь к Telegram, чтобы выбрать чат для экспорта.": "Connect to Telegram to choose a chat to export.",
+    "Перейти к подключению": "Go to Connection", "Ничего не найдено": "Nothing found",
+    "Измените запрос. Чат не из списка можно указать по @username, ссылке t.me или ID.":
+        "Change the query. A chat that is not in the list can be given by @username, t.me link or ID.",
+    "Этого чата нет в списке": "This chat is not in the list",
+    "Загружаю список чатов…": "Loading chat list…", "Это займёт несколько секунд.": "This takes a few seconds.",
+    "Нет ответа от Telegram": "No response from Telegram",
+    "Проверьте, что включён VPN или запущен прокси.": "Check that the VPN is on or the proxy is running.",
+    "посчитать": "count", "считаю…": "counting…", "Личный": "Private", "Группа": "Group", "Канал": "Channel",
+    "Перед скачиванием покажу, сколько файлов и места нужно.":
+        "Before downloading I'll show how many files and how much space are needed.",
+    "Сначала все чаты сканируются, потом скачиваются файлы. Перед скачиванием — одна общая сводка по всем чатам.":
+        "All chats are scanned first, then files are downloaded. Before downloading — one summary for all chats.",
+    "Сначала все чаты сканируются, потом скачиваются файлы. Скачивание начнётся сразу.":
+        "All chats are scanned first, then files are downloaded. Downloading starts right away.",
+    "Каждый чат сканируется и сразу скачивается, затем следующий. ":
+        "Each chat is scanned and downloaded, then the next one. ",
+    "Каждый чат сканируется и сразу скачивается, затем следующий. Перед скачиванием каждого чата — сводка; «Нет» пропустит файлы этого чата.":
+        "Each chat is scanned and downloaded, then the next one. Before each chat's download — a summary; «No» skips that chat's files.",
+    "Каждый чат сохранится в отдельную папку. Ошибка в одном чате не остановит остальные, а после «Остановить» экспорт продолжится с того же места.":
+        "Each chat is saved to its own folder. An error in one chat won't stop the others, and after «Stop» the export continues from the same place.",
+    "Какие чаты": "Which chats", "Пропускать чаты, которые уже полностью готовы": "Skip chats that are already complete",
+    "Не выбран ни один вид чатов": "No chat type selected",
+    # мои экспорты
+    "Все": "All", "Незавершённые": "Unfinished", "Готовые": "Complete", "Обновить": "Refresh",
+    "Продолжить": "Continue", "Начать заново": "Start over", "Версии…": "Versions…",
+    "Продолжить незавершённые": "Continue unfinished", "Состояние": "Status", "Прогресс": "Progress",
+    "Скорость": "Speed", "Осталось": "Remaining", "Объём файлов": "Files size", "Обновлён": "Updated",
+    "Версий": "Versions", "Общее": "General", "Проверить снова": "Check again",
+    "Настройки подключения": "Connection settings", "Сообщения": "Messages", "Завершится": "Finishes",
+    "Скачано": "Downloaded", "Пропущено": "Skipped", "Чаты": "Chats", "Свободно на диске": "Free disk space",
+    "Здесь появится ход экспорта: прогресс, скорость, прогноз окончания и журнал.":
+        "Export progress will appear here: progress, speed, estimated finish and the log.",
+    "5 мин": "5 min", "15 мин": "15 min", "1 час": "1 hour", "Открыть файл журнала": "Open log file",
+    "Пока нет экспортов": "No exports yet",
+    "Здесь появятся чаты, которые вы экспортируете, с их состоянием и действиями.":
+        "Chats you export will appear here with their status and actions.",
+    "Выбрать чат для экспорта": "Choose a chat to export", "Нет чатов в этой категории": "No chats in this category",
+    "Выберите другой фильтр вверху.": "Choose another filter above.", "Обновляю список…": "Refreshing…",
+    "Идёт": "In progress", "Идёт: сканирование": "In progress: scanning", "Идёт: скачивание": "In progress: downloading",
+    "Идёт: сборка HTML и JSON": "In progress: building HTML and JSON", "пауза": "paused", "пауза…": "paused…",
+    "сейчас": "now", "Готово": "Done", "Скачано не всё": "Not everything downloaded",
+    "Сканирование не завершено": "Scan not finished", "Просканирован, файлы не скачаны": "Scanned, files not downloaded",
+    "Файлы скачаны, HTML не собран": "Files downloaded, HTML not built", "Нет данных сканирования": "No scan data",
+    "Старая версия программы — нужно сканирование": "Old program version — needs scanning",
+    "нет доступа": "no access", "нет доступа (закрытый чат или вас удалили)": "no access (private chat or you were removed)",
+    "нужны права администратора": "admin rights required", "чат не найден": "chat not found",
+    "вы заблокированы в этом чате": "you are banned in this chat", "Открыть HTML": "Open HTML",
+    "Выберите версию в поле «Режим» и нажмите «Начать экспорт».":
+        "Choose a version in the «Mode» field and press «Start export».",
+    "Пересканировать всё заново?": "Rescan everything?",
+    "Вся история чата будет прочитана заново — на большом чате это займёт столько же времени, сколько первое сканирование.":
+        "The whole chat history will be read again — for a big chat this takes as long as the first scan.",
+    "Текущая версия сохранится и останется в списке «Режим». Уже скачанные файлы повторно не качаются.":
+        "The current version is kept in the «Mode» list. Already downloaded files are not downloaded again.",
+    "Продолжить экспорт": "Continue export", "Продолжить незавершённые": "Continue unfinished",
+    "Каждый продолжится с места остановки; ошибки в отдельных чатах не остановят остальные.":
+        "Each one continues where it stopped; errors in some chats won't stop the others.",
+    "Не удалось определить ID выбранных чатов.": "Couldn't determine the IDs of the selected chats.",
+    "Не удалось определить ID чата.": "Couldn't determine the chat ID.", "Нет чатов": "No chats",
+    # подключение
+    "Подключиться": "Connect", "Переподключиться": "Reconnect", "Выйти из аккаунта": "Log out",
+    "Показать hash": "Show hash", "Скрыть hash": "Hide hash", "Где взять API ID и hash →": "Where to get API ID and hash →",
+    "Прокси": "Proxy", "Без прокси": "No proxy", "MTProto (tg-ws-proxy)": "MTProto (tg-ws-proxy)",
+    "Ссылка": "Link", "Сервер": "Server", "Порт": "Port", "Секрет": "Secret", "Логин": "Login", "Пароль": "Password",
+    "Проверка связи": "Connection test",
+    "Сравните варианты: проверьте с включённым VPN, потом выключите VPN, запустите прокси и проверьте снова. Покажу пинг и скорость скачивания и подскажу, где быстрее.":
+        "Compare options: test with the VPN on, then turn the VPN off, start the proxy and test again. I'll show ping and download speed and tell you which is faster.",
+    "Проверить подключение": "Test connection", "Когда": "When", "Вариант": "Option", "Пинг": "Ping", "Итог": "Result",
+    "Выбрать этот вариант": "Use this option", "Без прокси / VPN": "No proxy / VPN", "проверяю…": "testing…",
+    "работает": "works", "не подключилось": "failed to connect",
+    "Проверяю… это займёт до полуминуты на вариант.": "Testing… up to half a minute per option.",
+    "Ищу файл для замера скорости…": "Looking for a file to measure speed…",
+    "Подходящего файла для замера скорости не нашлось — проверяю только подключение и пинг.":
+        "No suitable file to measure speed — testing connection and ping only.",
+    "Готово. Можно переключить VPN/прокси и проверить ещё раз.": "Done. You can switch VPN/proxy and test again.",
+    "Ни один вариант не подключился — проверьте интернет, VPN или прокси.":
+        "No option connected — check the internet, VPN or proxy.",
+    "Вариант выбран. Нажмите «Подключиться»/«Переподключиться», чтобы применить его.":
+        "Option selected. Press «Connect»/«Reconnect» to apply it.",
+    "Нужны API ID и API hash": "API ID and API hash are needed",
+    "Для проверки связи заполните API ID и API hash.": "Fill in API ID and API hash to test the connection.",
+    "Заполните API ID (число) и API hash.": "Fill in API ID (a number) and API hash.",
+    "Их можно получить на my.telegram.org → API development tools.": "Get them at my.telegram.org → API development tools.",
+    "Вход по QR-коду или по номеру телефона. Нужны API ID и API hash — их выдают бесплатно на my.telegram.org.":
+        "Log in with a QR code or phone number. API ID and API hash are needed — get them free at my.telegram.org.",
+    "Сессия сохранена — при следующем запуске программа подключится сама.":
+        "Session saved — next time the program will connect by itself.",
+    "Если откроется окно с QR-кодом, отсканируйте его в Telegram на телефоне.":
+        "If a QR code window opens, scan it in Telegram on your phone.",
+    "Подключение напрямую. Подходит, если VPN включён на весь компьютер.":
+        "Direct connection. Use it if a VPN is on for the whole computer.",
+    "Вставьте ссылку из tg-ws-proxy (значок в трее → «Скопировать ссылку») или заполните сервер, порт и секрет вручную.":
+        "Paste the link from tg-ws-proxy (tray icon → «Copy link») or fill in server, port and secret manually.",
+    "Локальный SOCKS5-порт VPN-клиента или обычный SOCKS5-прокси.": "A VPN client's local SOCKS5 port or a regular SOCKS5 proxy.",
+    "Нажмите «Подключиться», чтобы войти в Telegram.": "Press «Connect» to log in to Telegram.",
+    "Укажите API ID и API hash и нажмите «Подключиться».": "Enter API ID and API hash and press «Connect».",
+    "Подключаюсь к Telegram…": "Connecting to Telegram…", "Проверяю связь с Telegram…": "Checking connection to Telegram…",
+    "Переподключиться?": "Reconnect?",
+    "Экспорт ненадолго приостановится: программа переподключится с текущими настройками и продолжит с того же места.":
+        "The export will pause briefly: the program reconnects with the current settings and continues from the same place.",
+    "Выйти из аккаунта Telegram в этой программе?": "Log out of Telegram in this program?",
+    "Чтобы снова экспортировать чаты, понадобится войти заново.": "To export chats again you'll need to log in again.",
+    "Нужно подключение": "Connection required",
+    "Сначала подключитесь к Telegram на странице «Подключение».": "Connect to Telegram on the «Connection» page first.",
+    "Сначала подключитесь к Telegram.": "Connect to Telegram first.",
+    "Подключитесь к Telegram и дождитесь загрузки списка чатов.": "Connect to Telegram and wait for the chat list.",
+    "Вход по QR-коду": "QR code login",
+    "Откройте Telegram на телефоне: Настройки → Устройства → Подключить устройство, и наведите камеру на код.":
+        "Open Telegram on your phone: Settings → Devices → Link Desktop Device, and point the camera at the code.",
+    "Код обновляется сам, когда истекает.": "The code refreshes by itself when it expires.",
+    "Войти по номеру телефона": "Log in with phone number",
+    "Вход в Telegram": "Telegram login", "Номер телефона (в формате +7...):": "Phone number (e.g. +1...):",
+    "Код подтверждения": "Confirmation code", "Облачный пароль": "Cloud password",
+    "Введите облачный пароль (двухэтапная аутентификация):": "Enter your cloud password (two-step verification):",
+    "Введите код. Оставьте поле пустым и нажмите OK,": "Enter the code. Leave it empty and press OK",
+    "чтобы запросить код повторно (другим способом, если Telegram позволит).": "to request the code again (another way, if Telegram allows).",
+    "чтобы запросить код повторно.": "to request the code again.",
+    "Введите код": "Enter the code", "Введите пароль": "Enter the password",
+    "Неверный код, попробуйте ещё раз.": "Wrong code, try again.",
+    # настройки
+    "Сохранение": "Saving", "Папка экспорта": "Export folder", "Форматы": "Formats",
+    "HTML — для просмотра в браузере": "HTML — to view in a browser", "JSON — формат Telegram Desktop": "JSON — Telegram Desktop format",
+    "Скорость и надёжность": "Speed and reliability", "Файлов одновременно": "Files at once", "оптимально 3–6": "3–6 is optimal",
+    "Потоков на большой файл": "Threads per large file", "для файлов больше 2 МБ": "for files over 2 MB",
+    "Зависшим считать через, с": "Treat as stuck after, s", "если не пришло ни одного байта": "if not a single byte arrived",
+    "Повторов перед пропуском": "Retries before skipping", "потом файл пропускается и попадает в отчёт": "then the file is skipped and listed in the report",
+    "Язык программы": "Program language", "Как в системе": "System default", "Русский": "Русский", "English": "English",
+    "Оформление": "Appearance", "Тема": "Theme", "Светлая": "Light", "Тёмная": "Dark",
+    "Язык изменится после перезапуска программы.": "The language will change after the program restarts.",
+    "Чтобы сменить язык, программу нужно перезапустить. Перезапустить сейчас?": "The program must restart to change the language. Restart now?",
+    "Проверьте настройки": "Check the settings",
+    "Укажите папку для сохранения на странице «Настройки».": "Choose the save folder on the «Settings» page.",
+    "Выберите чат": "Choose a chat",
+    "Выберите чат в списке или введите его @username, ссылку или ID.": "Choose a chat in the list or enter its @username, link or ID.",
+    "Без файлов": "No files", "Не выбран ни один тип файлов. Экспортировать только текст?": "No file types selected. Export text only?",
+    "Файл журнала появится в папке чата после начала экспорта.": "The log file appears in the chat folder after the export starts.",
+    "Папка ещё не создана.": "The folder doesn't exist yet.", "HTML ещё не создан — он появляется в конце экспорта.": "HTML isn't built yet — it appears at the end of the export.",
+    "Выход": "Exit", "Идёт работа. Остановить и выйти?": "Work in progress. Stop and exit?",
+    "При следующем запуске работа продолжится с того же места.": "Next time it will continue from the same place.",
+    "Посчитать сообщения": "Count messages",
+    "Можно продолжать работу, подсчёт идёт в фоне и его можно остановить.": "You can keep working; counting runs in the background and can be stopped.",
+    "Начать?": "Start?",
+    # отчёт
+    "Отчёт об экспорте": "Export report", "Докачать недостающее": "Download missing files", "Список пропущенных": "Skipped files",
+    "Экспорт завершён полностью": "Export completed", "Экспорт завершён, но скачано не всё": "Export finished, but not everything was downloaded",
+    "Все чаты экспортированы полностью": "All chats exported completely",
+    "Экспорт всех чатов завершён, но не всё скачано": "Exporting all chats finished, but not everything was downloaded",
+    "ОБЩЕЕ": "SUMMARY", "ПО ТИПАМ ФАЙЛОВ": "BY FILE TYPE", "РЕЗУЛЬТАТ": "RESULT", "ТРЕБУЮТ ВНИМАНИЯ": "NEED ATTENTION",
+    "Медиа к скачиванию:": "Media to download:", "  файлов в чате нет": "  no files in the chat",
+    "Полный лог: export.log": "Full log: export.log", "JSON: result.json (формат Telegram Desktop)": "JSON: result.json (Telegram Desktop format)",
+    "Чтобы докачать недостающее, нажмите «Докачать недостающее» или «Продолжить» в «Моих экспортах» — скачанное повторно не загружается.":
+        "To get the missing files, press «Download missing files» or «Continue» in «My exports» — downloaded files are not fetched again.",
+    "Запустите «Экспорт всех чатов» ещё раз — готовые чаты пропустятся, остальные продолжатся с места остановки.":
+        "Run «Export all chats» again — complete chats are skipped, the rest continue where they stopped.",
+    "Нажмите «Начать экспорт» ещё раз — недостающие файлы будут докачаны.": "Press «Start export» again — missing files will be downloaded.",
+    "Списoк всех чатов со ссылками: index.html. Журнал: _all_chats.log": "List of all chats with links: index.html. Log: _all_chats.log",
+    "Список всех чатов со ссылками: index.html. Журнал: _all_chats.log": "List of all chats with links: index.html. Log: _all_chats.log",
+    # статусы и журнал
+    "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
+    "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
+    "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
+    "Создаю HTML и JSON...": "Building HTML and JSON...", "Сохраняю версию сканирования...": "Saving the scan version...",
+    "Готово, но не всё скачано": "Done, but not everything downloaded", "Останавливаю…": "Stopping…",
+    "Готово к экспорту": "Ready to export", "Загружаю список чатов...": "Loading chat list...", "Вход по QR-коду...": "QR code login...",
+    "Вы вышли из аккаунта.": "You have logged out.",
+    "Найдена сохранённая сессия — подключаюсь автоматически...": "Saved session found — connecting automatically...",
+    "Подключение напрямую (без прокси)": "Connecting directly (no proxy)",
+    "Аккаунт с Telegram Premium — скорость загрузки не ограничивается Telegram.": "Telegram Premium account — Telegram doesn't limit download speed.",
+    "ℹ Аккаунт без Telegram Premium: Telegram ограничивает скорость загрузки файлов для таких аккаунтов. Многопоточность частично помогает, но потолок задаёт сервер.":
+        "ℹ No Telegram Premium: Telegram limits download speed for such accounts. Multiple threads help partly, but the server sets the ceiling.",
+    "Ускоритель шифрования cryptg: включён.": "cryptg encryption accelerator: on.",
+    "Отсканируйте QR-код в приложении Telegram на телефоне: Настройки → Устройства → Подключить устройство.":
+        "Scan the QR code in Telegram on your phone: Settings → Devices → Link Desktop Device.",
+    "⚡ Включён режим экспорта Telegram: меньше пауз при чтении истории. На других ваших устройствах Telegram может показать уведомление о запросе экспорта — это он.":
+        "⚡ Telegram export mode is on: fewer pauses while reading history. Telegram may show a data export notification on your other devices — that's this.",
+    "Связь с Telegram восстановлена.": "Connection to Telegram restored.",
+    "Переподключаюсь к Telegram...": "Reconnecting to Telegram...",
+    "📡 Связь восстановлена — продолжаю с места остановки.": "📡 Connection restored — continuing where it stopped.",
+    "Остановлено. При следующем запуске загрузка продолжится с места остановки.": "Stopped. Next time downloading continues where it stopped.",
+    "▶ Продолжаю экспорт после переподключения.": "▶ Continuing the export after reconnecting.",
+    "Скачивание начинается сразу (настройка «Сразу скачивать после сканирования»).": "Downloading starts right away (the «Download right away» setting).",
+    "Группа была преобразована в супергруппу — экспортирую и историю до преобразования.":
+        "The group was converted to a supergroup — exporting its earlier history too.",
+    "Изменились типы файлов или лимит размера — история сканируется заново (в этой версии программы такое больше не понадобится).":
+        "File types or size limit changed — the history is scanned again (this version won't need that anymore).",
+    "⏭ Файлы этого чата пропущены по вашему выбору — их можно докачать позже.": "⏭ This chat's files were skipped as you chose — you can download them later.",
+    "✅ Место на диске появилось — продолжаю скачивание.": "✅ Disk space is available — continuing the download.",
+    "Скачать файлы всех чатов?": "Download files of all chats?", "Начать загрузку?": "Start downloading?",
+    "Начать скачивание?": "Start downloading?",
+    "▶ Скачиваю файлы чатов по очереди.": "▶ Downloading chats' files one by one.",
+    "⏹ Скачивание файлов отложено. Чаты просканированы — продолжить можно в «Моих экспортах».":
+        "⏹ File download postponed. Chats are scanned — you can continue in «My exports».",
+    "Проверка не удалась": "Test failed",
+    "нет прогресса": "no progress",
+    "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси. Ничего не потеряется: программа продолжит сама, когда связь появится.":
+        "check that the VPN is on or the proxy (tg-ws-proxy) is running, and that the right proxy type is selected on the «Connection» page. Nothing will be lost: the program continues by itself once the connection is back.",
+})
+
+# ----------------------------- английский: шаблоны -----------------------------
+_R = re.compile
+
+
+def _u(f):
+    """Шаблон-функция + перевод единиц в результате."""
+    return lambda m: _tr_units(f(m))
+
+
+EN_RE.extend([
+    (_R(r"Подключено: (.+)"), r"Connected: \1"),
+    (_R(r"Выбрано чатов: (\d+)"), r"Chats selected: \1"),
+    (_R(r"Экспортировать выбранные \((\d+)\)"), r"Export selected (\1)"),
+    (_R(r"Сохранение: (.+)"), lambda m: f"Saving to: {tr(m.group(1))}"),
+    (_R(r"(Личный|Группа|Канал) · (.+)"), lambda m: f"{tr(m.group(1))} · {tr(m.group(2))}"),
+    (_R(r"([\d ]+) сообщений"), _u(lambda m: f"{m.group(1)} messages")),
+    (_R(r"считаю сообщения…"), "counting messages…"),
+    (_R(r"не удалось посчитать сообщения"), "couldn't count messages"),
+    (_R(r"Экспорт пойдёт по адресу «(.+)» — нажмите «Начать экспорт»\."),
+     r"The export will use «\1» — press «Start export»."),
+    (_R(r"Личные · (\d+)"), r"Private · \1"), (_R(r"Группы · (\d+)"), r"Groups · \1"), (_R(r"Каналы · (\d+)"), r"Channels · \1"),
+    (_R(r"Будет экспортировано чатов: (\d+)"), r"Chats to export: \1"),
+    (_R(r"Папка: (.+)"), r"Folder: \1"), (_R(r"Чат: (.+)"), r"Chat: \1"),
+    (_R(r"(\d+) чатов · готово (\d+) · незавершённых (\d+)"), r"\1 chats · \2 complete · \3 unfinished"),
+    (_R(r"Мои экспорты  ·  (\d+%)"), r"My exports  ·  \1"), (_R(r"Мои экспорты  ·  идёт"), "My exports  ·  running"),
+    (_R(r"Мои экспорты  ·  нет места"), "My exports  ·  no space"),
+    (_R(r"(Чат|Тип|Сообщений) ([▲▼])"), lambda m: f"{tr(m.group(1))} {m.group(2)}"),
+    (_R(r"Считаю сообщения: (\d+) из (\d+)"), r"Counting messages: \1 of \2"),
+    (_R(r"Нужно посчитать (\d+) чатов — это \d+ запросов к Telegram, примерно (\d+) мин\. \(Telegram может просить паузы\.\)"),
+     r"\1 chats to count — that's \1 requests to Telegram, about \2 min. (Telegram may ask for pauses.)"),
+    (_R(r"Из версии от (.+) · ([\d ]+) сообщ\."), r"From version of \1 · \2 msgs"),
+    (_R(r"(.+) \(скан, с паузами\)"), _u(lambda m: f"{m.group(1)} (scan, incl. pauses)")),
+    (_R(r"скан: (.+)"), _u(lambda m: f"scan: {m.group(1)}")),
+    (_R(r"просканировано ([\d ]+)"), r"scanned \1"),
+    (_R(r"([\d ]+) из ([\d ]+) \((\d+%)\)( · .+)?"),
+     _u(lambda m: f"{m.group(1)} of {m.group(2)} ({m.group(3)})" + (tr(m.group(4)[3:]).join([" · ", ""]) if m.group(4) else ""))),
+    (_R(r"(.+) / (.+) \((\d+%)\)"), _u(lambda m: f"{m.group(1)} / {m.group(2)} ({m.group(3)})")),
+    (_R(r"(.+)/с · ср\. (.+)/с"), _u(lambda m: f"{m.group(1)}/s · avg {m.group(2)}/s")),
+    (_R(r"([\d ]+) сообщ\./с"), r"\1 msg/s"), (_R(r"([\d ]+)/с"), r"\1/s"),
+    (_R(r"([\d ]+) из ([\d ]+)"), r"\1 of \2"),
+    (_R(r"(\d+) из (\d+): (.+)"), r"\1 of \2: \3"),
+    (_R(r"(.+) · чат (\d+) из (\d+)"), r"\1 · chat \2 of \3"),
+    (_R(r"найдено (.+)"), _u(lambda m: f"found {m.group(1)}")),
+    (_R(r"([\d.,]+ (?:Б|КБ|МБ|ГБ|ТБ)) из ([\d.,]+ (?:Б|КБ|МБ|ГБ|ТБ))"), _u(lambda m: f"{m.group(1)} of {m.group(2)}")),
+    (_R(r"(.+) — ([\d.,]+ (?:Б|КБ|МБ|ГБ|ТБ)) — (.+)"), _u(lambda m: f"{m.group(1)} — {m.group(2)} — {tr(m.group(3))}")),
+    (_R(r"−(\d+) мин"), r"−\1 min"), (_R(r"−1 ч"), "−1 h"), (_R(r"−30 мин"), "−30 min"),
+    (_R(r"Скорость (скачивания|сканирования, сообщений в секунду)  ·  сейчас (.+)  ·  в среднем (.+)  ·  максимум (.+)"),
+     _u(lambda m: ("Download speed" if m.group(1) == "скачивания" else "Scan speed, messages per second")
+        + f"  ·  now {m.group(2)}  ·  average {m.group(3)}  ·  peak {m.group(4)}")),
+    (_R(r"Скорость появится, когда начнётся сканирование или скачивание"), "Speed appears once scanning or downloading starts"),
+    (_R(r"Быстрее всего: (.+) \((.+)\) — (.+)"),
+     _u(lambda m: f"Fastest: {tr(m.group(1))} ({m.group(2)}) — " + m.group(3).replace("пинг", "ping"))),
+    (_R(r"Telegram не отвечает уже (.+?) — (.+)"), lambda m: f"Telegram hasn't responded for {_tr_units(m.group(1))} — {tr(m.group(2))}"),
+    (_R(r"Не хватает места на диске: освободите ещё (.+)\. Скачивание на паузе и продолжится само, как только место появится\."),
+     _u(lambda m: f"Not enough disk space: free up {m.group(1)} more. Downloading is paused and continues by itself once there's space.")),
+    # длинные подсказки о связи
+    (_R(r"(Нет связи с Telegram|Telegram долго не отвечает) — проверьте, что включён VPN или запущен прокси \(tg-ws-proxy\), и что на странице «Подключение» выбран нужный вид прокси\.(.*)"),
+     lambda m: ("No connection to Telegram" if m.group(1).startswith("Нет") else "Telegram isn't responding")
+        + " — check that the VPN is on or the proxy (tg-ws-proxy) is running, and that the right proxy type is selected on the «Connection» page."
+        + {"": "", " Программа продолжит сама, когда связь появится.": " The program will continue by itself once the connection is back.",
+           " Ничего не потеряется: программа продолжит сама, когда связь появится.": " Nothing will be lost: the program continues by itself once the connection is back.",
+           " Можно нажать «Отмена», поменять настройки и подключиться снова.": " You can press «Cancel», change the settings and connect again."}.get(m.group(2), tr(m.group(2)))),
+    (_R(r"Нет связи с Telegram"), "No connection to Telegram"),
+    (_R(r"Нет связи с Telegram\. Проверю снова через (\d+) с — продолжу сам, как только связь появится\."),
+     r"No connection to Telegram. Checking again in \1 s — I'll continue once it's back."),
+    (_R(r"Нет связи с Telegram — следующая проверка через (\d+) с \(или нажмите «Проверить снова»\)"),
+     r"No connection to Telegram — next check in \1 s (or press «Check again»)"),
+    (_R(r"Не удаётся связаться с Telegram \((.+)\)\. Похоже, нет интернета, выключен VPN или не запущен прокси\. Программа продолжит сама, когда связь появится\."),
+     r"Can't reach Telegram (\1). Looks like there's no internet, the VPN is off or the proxy isn't running. The program will continue by itself once it's back."),
+    (_R(r"Не хватает места на диске — освободите ещё (.+), скачивание продолжится само\."),
+     _u(lambda m: f"Not enough disk space — free up {m.group(1)} more, downloading will continue by itself.")),
+    (_R(r"Не хватает места на диске: нужно ещё (.+)\. Скачивание на паузе — освободите место, и оно продолжится само\."),
+     _u(lambda m: f"Not enough disk space: {m.group(1)} more needed. Downloading is paused — free up space and it continues by itself.")),
+    # журнал экспорта
+    (_R(r"Сообщений в чате: ([\d ]+)"), r"Messages in chat: \1"),
+    (_R(r"Сканирую историю: (\d+)( из \d+)?( · закончу ≈ (.+))?\.\.\."),
+     _u(lambda m: f"Scanning history: {m.group(1)}" + (m.group(2) or "").replace(" из ", " of ")
+        + (f" · done ≈ {m.group(4)}" if m.group(3) else "") + "...")),
+    (_R(r"Сканирование: (\d+) из (\d+)\. Закончится примерно (.+) \(осталось (.+), с учётом пауз Telegram\)\."),
+     _u(lambda m: f"Scanning: {m.group(1)} of {m.group(2)}. Will finish around {m.group(3)} ({m.group(4)} left, incl. Telegram pauses).")),
+    (_R(r"Сканирование завершено: (\d+) сообщений\."), r"Scan finished: \1 messages."),
+    (_R(r"Просканировано сообщений: (\d+)"), r"Messages scanned: \1"),
+    (_R(r"Просканирован: (.+)"), r"Scanned: \1"),
+    (_R(r"История уже просканирована \((\d+) сообщений\) — проверяю только новые\."),
+     r"History already scanned (\1 messages) — checking new ones only."),
+    (_R(r"Продолжаю сканирование с места остановки: уже (\d+) сообщений( из \d+)?\."),
+     lambda m: f"Continuing the scan where it stopped: {m.group(1)} messages already" + (m.group(2) or "").replace(" из ", " of ") + "."),
+    (_R(r"Сохранена версия сканирования от (.+) — из неё можно сделать экспорт в любой момент \(поле «Режим» на странице «Экспорт»\)\."),
+     r"Scan version of \1 saved — you can export from it any time («Mode» field on the «Export» page)."),
+    (_R(r"Сохранена версия от (.+) \(до пересканирования\)\."), r"Version of \1 saved (before rescanning)."),
+    (_R(r"Полное пересканирование: .+"), "Full rescan: the whole history is read again — this makes a new version (with edits and without deleted messages). Downloaded files are not fetched again."),
+    (_R(r"Экспорт из сохранённой версии от (.+): (\d+) сообщений\..+"),
+     r"Exporting from the saved version of \1: \2 messages. History isn't read from Telegram again; files are downloaded for this version (files of messages deleted since can't be fetched)."),
+    (_R(r"(.+): (\d+) шт\., (.+) \(осталось (\d+), (.+)\)"),
+     _u(lambda m: f"{tr(m.group(1))}: {m.group(2)} pcs, {m.group(3)} ({m.group(4)} left, {m.group(5)})")),
+    (_R(r"Больше лимита (\d+) МБ \(пропускаются\): (\d+) шт\."), r"Over the \1 MB limit (skipped): \2 pcs"),
+    (_R(r"Уже скачано ранее: (\d+) файлов"), r"Already downloaded: \1 files"),
+    (_R(r"Осталось скачать: (\d+) файлов, (.+)"), _u(lambda m: f"Left to download: {m.group(1)} files, {m.group(2)}")),
+    (_R(r"Недокачанных файлов: (\d+) \((.+) уже скачано\) — будут докачаны с места обрыва"),
+     _u(lambda m: f"Partly downloaded files: {m.group(1)} ({m.group(2)} already) — they'll resume where they stopped")),
+    (_R(r"Свободно на диске: (.+)\.?"), _u(lambda m: f"Free disk space: {m.group(1)}")),
+    (_R(r"Места хватает \(останется ~(.+)\)\."), _u(lambda m: f"Enough space (~{m.group(1)} will remain).")),
+    (_R(r"⚠ МЕСТА НЕ ХВАТИТ: нужно ещё ~(.+)\. .+"),
+     _u(lambda m: f"⚠ NOT ENOUGH SPACE: ~{m.group(1)} more needed. Downloading will start; when space runs out it pauses and continues by itself once you free up space.")),
+    (_R(r"Скачать файлы этого чата\?"), "Download this chat's files?"),
+    (_R(r"«Нет» — пропустить файлы этого чата \(тексты и HTML сохранятся, файлы можно докачать позже\)\."),
+     "«No» — skip this chat's files (texts and HTML are kept, files can be downloaded later)."),
+    (_R(r"(.+) — (.+) за (.+) \((.+)/с(, докачан с (.+))?\)"),
+     _u(lambda m: f"{m.group(1)} — {m.group(2)} in {m.group(3)} ({m.group(4)}/s" + (f", resumed from {m.group(6)}" if m.group(5) else "") + ")")),
+    (_R(r"Пропущен файл \(сообщение (.+), (.+)\): (.+)"), _u(lambda m: f"File skipped (message {m.group(1)}, {m.group(2)}): {tr(m.group(3))}")),
+    (_R(r"Повтор (\d+)/(\d+) для сообщения (.+) \(продолжу с (.+)\): (.+)"),
+     _u(lambda m: f"Retry {m.group(1)}/{m.group(2)} for message {m.group(3)} (resuming from {m.group(4)}): {tr(m.group(5))}")),
+    (_R(r"сообщение удалено или файл больше недоступен"), "message deleted or file no longer available"),
+    (_R(r"нет прогресса (\d+) с"), r"no progress for \1 s"),
+    (_R(r"HTML: (\d+) стр\. → (.+)"), r"HTML: \1 pages → \2"), (_R(r"JSON → (.+)"), r"JSON → \1"),
+    (_R(r"Готово\. Сообщений: (\d+)\. Файлов на диске: (\d+) из (\d+)\."), r"Done. Messages: \1. Files on disk: \2 of \3."),
+    (_R(r"• (.+): (\d+)"), lambda m: f"• {tr(m.group(1))}: {m.group(2)}"),
+    (_R(r"не удалось скачать \(в failed\.txt\)"), "failed to download (see failed.txt)"),
+    (_R(r"не хватило места"), "not enough space"), (_R(r"не найдено на диске"), "not found on disk"),
+    (_R(r"больше лимита (\d+) МБ"), r"over the \1 MB limit"), (_R(r"тип отключён в настройках"), "type disabled in settings"),
+    (_R(r"Завершено: (.+), время работы: (.+)"), r"Finished: \1, running time: \2"),
+    (_R(r"Завершено: (.+)"), r"Finished: \1"), (_R(r"Время работы: (.+?)( \(автоперезапусков после сбоев: (\d+)\))?"),
+                                               lambda m: f"Running time: {m.group(1)}" + (f" (auto-restarts after failures: {m.group(3)})" if m.group(2) else "")),
+    (_R(r"Скачано за этот запуск: (.+?)(, средняя скорость (.+))?"),
+     _u(lambda m: f"Downloaded this run: {m.group(1)}" + (f", average speed {m.group(3)}" if m.group(2) else ""))),
+    (_R(r"Сообщений: (\d+) \(обычных (\d+), служебных (\d+), с реакциями (\d+)\)"),
+     r"Messages: \1 (regular \2, service \3, with reactions \4)"),
+    (_R(r"Период: (.+)"), r"Period: \1"), (_R(r"Файлов на диске: (\d+) из (\d+)"), r"Files on disk: \1 of \2"),
+    (_R(r"Размер папки экспорта: (.+), свободно на диске: (.+)"), _u(lambda m: f"Export folder size: {m.group(1)}, free disk space: {m.group(2)}")),
+    (_R(r"(.+): (\d+) из (\d+) скачано \((.+)\)( — (.+))?"),
+     _u(lambda m: f"{tr(m.group(1))}: {m.group(2)} of {m.group(3)} downloaded ({m.group(4)})" + (f" — {tr(m.group(6))}" if m.group(5) else ""))),
+    (_R(r"НЕ УДАЛОСЬ СКАЧАТЬ \((\d+)\)"), r"FAILED TO DOWNLOAD (\1)"),
+    (_R(r"… и ещё (\d+) \(полный список в failed\.txt\)"), r"… and \1 more (full list in failed.txt)"),
+    (_R(r"HTML: messages\.html \((\d+) стр\.\)"), r"HTML: messages.html (\1 pages)"),
+    (_R(r"Кастомные эмодзи: (\d+)"), r"Custom emoji: \1"),
+    (_R(r"Чатов выбрано: (\d+)"), r"Chats selected: \1"), (_R(r"полностью готовы: (\d+)"), r"complete: \1"),
+    (_R(r"тексты сохранены, но не все файлы скачаны: (\d+)"), r"texts saved, but not all files downloaded: \1"),
+    (_R(r"не удалось экспортировать: (\d+)"), r"failed to export: \1"),
+    (_R(r"просканированы, файлы ещё не скачаны: (\d+)"), r"scanned, files not downloaded yet: \1"),
+    (_R(r"(.+) — файлов (\d+) из (\d+)"), r"\1 — files \2 of \3"),
+    # экспорт нескольких чатов
+    (_R(r"Экспорт (?:чатов|всех чатов): выбрано (\d+)(, уже готовы и пропускаются: (\d+))?, к экспорту: (\d+)(.*)"),
+     lambda m: f"Exporting chats: selected {m.group(1)}" + (f", already complete and skipped: {m.group(3)}" if m.group(2) else "")
+        + f", to export: {m.group(4)}" + m.group(5).replace("; порядок: сначала сканировать все, потом скачивать", "; order: scan all first, then download")
+        .replace("; порядок: по очереди", "; order: one by one").replace("; перед скачиванием — сводка", "; summary before downloading")),
+    (_R(r"(Чат|Сканирование чата|Скачивание чата) (\d+) из (\d+)( \(повтор\))?: (.+) \[(.+)\]"),
+     lambda m: f"{dict(zip(('Чат', 'Сканирование чата', 'Скачивание чата'), ('Chat', 'Scanning chat', 'Downloading chat')))[m.group(1)]} "
+        f"{m.group(2)} of {m.group(3)}" + (" (retry)" if m.group(4) else "") + f": {m.group(5)} [{tr(m.group(6))}]"),
+    (_R(r"(.+): сообщений (\d+), файлов (\d+) из (\d+)"), r"\1: messages \2, files \3 of \4"),
+    (_R(r"(.+): сообщений (\d+), к скачиванию файлов (\d+) \((.+)\)"), _u(lambda m: f"{m.group(1)}: messages {m.group(2)}, files to download {m.group(3)} ({m.group(4)})")),
+    (_R(r"(.+): не удалось \((.+)\)\. Перехожу к следующему чату(\.| — в конце попробую этот чат ещё раз\.)"),
+     lambda m: f"{m.group(1)}: failed ({m.group(2)}). Moving on to the next chat" + ("." if m.group(3) == "." else " — I'll retry this chat at the end.")),
+    (_R(r"Повторяю чаты, где были сбои: (\d+)"), r"Retrying chats that failed: \1"),
+    (_R(r"Все чаты просканированы: (\d+) из (\d+)\."), r"All chats scanned: \1 of \2."),
+    (_R(r"К скачиванию: (\d+) файлов, (.+)\."), _u(lambda m: f"To download: {m.group(1)} files, {m.group(2)}.")),
+    (_R(r"(.+): (\d+) файлов, (.+)"), _u(lambda m: f"{m.group(1)}: {m.group(2)} files, {m.group(3)}")),
+    (_R(r"⚠ Места не хватит: нужно ещё ~(.+?)\..+"),
+     _u(lambda m: f"⚠ Not enough space: ~{m.group(1)} more needed. Downloading starts; when space runs out it pauses until you free some up.")),
+    # вход и прочее
+    (_R(r"✅ Вход выполнен: (.+)"), r"✅ Logged in: \1"), (_R(r"Найдено чатов: (\d+)"), r"Chats found: \1"),
+    (_R(r"Подключение через MTProto-прокси (.+)"), r"Connecting via MTProto proxy \1"),
+    (_R(r"Подключение через SOCKS5 (.+)"), r"Connecting via SOCKS5 \1"),
+    (_R(r"Код отправлен: (.+)"), lambda m: f"Code sent: {tr(m.group(1))}"),
+    (_R(r"Код отправлен (.+?)\.( Если не придёт.+)?"), lambda m: f"Code sent {tr(m.group(1))}." + (" If it doesn't arrive, you can request it again." if m.group(2) else "")),
+    (_R(r"Запрашиваю код для (.+)\.\.\."), r"Requesting a code for \1..."),
+    (_R(r"Пароль не подошёл: (.+)"), r"Wrong password: \1"),
+    (_R(r"в приложение Telegram на другом вашем устройстве.*"), "to the Telegram app on your other device (the «Telegram» chat with a blue check), not by SMS"),
+    (_R(r"по SMS"), "by SMS"), (_R(r"на вашу почту, привязанную к Telegram"), "to the email linked to Telegram"),
+    (_R(r"ℹ Режим экспорта Telegram пока недоступен: в целях безопасности Telegram разрешит его с (.+?) \(.+"),
+     r"ℹ Telegram export mode isn't available yet: for security Telegram will allow it from \1 (usually a day after logging in on a new device). Exporting in normal mode — Telegram will pause briefly every ~3000 messages."),
+    (_R(r"ℹ Режим экспорта Telegram не включился \((.+)\)\. Экспорт идёт в обычном режиме\."),
+     r"ℹ Telegram export mode didn't turn on (\1). Exporting in normal mode."),
+    (_R(r"⏸ Telegram попросил паузу (\d+) с \(ограничение частоты запросов\)\. Программа подождёт и продолжит сама\."),
+     r"⏸ Telegram asked for a \1 s pause (rate limit). The program will wait and continue by itself."),
+    (_R(r"⏸ Пауза по требованию Telegram: (\d+) с — ограничение частоты запросов, это нормально"),
+     r"⏸ Pause requested by Telegram: \1 s — rate limit, this is normal"),
+    (_R(r"⏸ Пауза по требованию Telegram: (\d+) с"), r"⏸ Pause requested by Telegram: \1 s"),
+    (_R(r"⏸ Telegram просит подождать (\d+) с.*"), r"⏸ Telegram asks to wait \1 s — waiting and continuing from the same place."),
+    (_R(r"⚠ Сбой: (.+?) — похоже, пропала связь с Telegram\."), r"⚠ Failure: \1 — looks like the connection to Telegram was lost."),
+    (_R(r"⚠ Сбой: (.+)"), r"⚠ Failure: \1"),
+    (_R(r"Автоматически продолжу через (\d+) с \(попытка (\d+) из (\d+)\)\. Уже скачанное не потеряется\."),
+     r"Will continue automatically in \1 s (attempt \2 of \3). Nothing downloaded will be lost."),
+    (_R(r"Сбой — повтор через (\d+) с\.\.\."), r"Failure — retrying in \1 s..."),
+    (_R(r"❌ Ошибка: (.+)"), r"❌ Error: \1"),
+    (_R(r"❌ Не удалось создать (HTML|JSON): (.+)"), r"❌ Couldn't build \1: \2"),
+    (_R(r"⚠ Сообщение (.+) разобрано не полностью \((.+)\) — сохраняю текст и иду дальше\."),
+     r"⚠ Message \1 was only partly parsed (\2) — keeping its text and moving on."),
+    (_R(r"Не удалось сохранить (.+): (.+)"), r"Couldn't save \1: \2"),
+    (_R(r"Проверка не удалась: (.+)"), r"Test failed: \1"),
+    (_R(r"В поле «(.+)» должно быть целое число\."), lambda m: f"The «{tr(m.group(1))}» field must be a whole number."),
+    (_R(r"Продолжить экспорт выбранных чатов \((\d+)\) по очереди\?"), r"Continue exporting the selected chats (\1) one by one?"),
+    (_R(r"Продолжить все незавершённые чаты \((\d+)\) по очереди\?"), r"Continue all unfinished chats (\1) one by one?"),
+    (_R(r"Сохранённая версия «(.+)» не найдена в папке (.+)\."), r"Saved version «\1» wasn't found in \2."),
+])
+
+# ----------------------------- дополнения: ошибки, причины, вход -----------------------------
+EN.update({
+    "(без названия)": "(untitled)", "Удалённый аккаунт": "Deleted account", "папка не выбрана": "no folder selected",
+    "ошибка": "error", "файл недоступен": "file unavailable",
+    "файл скачан не полностью, будет докачан": "file downloaded only partly, will be resumed",
+    "размер файла не совпал, будет докачан": "file size mismatch, will be resumed",
+    "Для SOCKS5 нужен пакет python-socks: pip install python-socks[asyncio]":
+        "SOCKS5 needs the python-socks package: pip install python-socks[asyncio]",
+    "Не указан секрет прокси: вставьте ссылку tg://proxy... или секрет.": "Proxy secret is missing: paste a tg://proxy... link or the secret.",
+    "Секрет начинается с «ee» — это режим Fake TLS, он не поддерживается.": "The secret starts with «ee» — that's Fake TLS mode, which isn't supported.",
+    "Выключите Fake TLS в настройках tg-ws-proxy (нужен секрет с «dd») и скопируйте ссылку заново.":
+        "Turn off Fake TLS in tg-ws-proxy settings (a «dd» secret is needed) and copy the link again.",
+    "Пакет qrcode не установлен (pip install qrcode) — вход по QR недоступен, используется вход по номеру.":
+        "The qrcode package isn't installed (pip install qrcode) — QR login is unavailable, using phone login.",
+    "⚠ Ускоритель cryptg НЕ установлен — шифрование идёт медленно и может ограничивать скорость. Установите: pip install cryptg (или перезапустите через «Запуск.bat»).":
+        "⚠ The cryptg accelerator is NOT installed — encryption is slow and may limit speed. Install it: pip install cryptg (or restart via «Запуск.bat»).",
+    "Сначала подключитесь к Telegram (страница «Подключение»).": "Connect to Telegram first («Connection» page).",
+    "голосовым звонком": "by a voice call", "звонком (код — последние цифры номера)": "by a call (the code is the last digits of the number)",
+    "пропущенным звонком (код — последние цифры номера звонившего)": "by a missed call (the code is the last digits of the caller's number)",
+    "через Fragment (для анонимных номеров)": "via Fragment (for anonymous numbers)",
+    "по SMS (кодовое слово)": "by SMS (code word)", "по SMS (кодовая фраза)": "by SMS (code phrase)",
+    "— Telegram требует сначала привязать почту в официальном приложении": "— Telegram requires linking an email in the official app first",
+    "в приложение Telegram на другом вашем устройстве — в чат «Telegram» (с синей галочкой), а не по SMS":
+        "to the Telegram app on your other device — the «Telegram» chat (with a blue check), not by SMS",
+    "Нет": "No", "Да": "Yes",
+})
+EN_RE.extend([
+    (_R(r"файл скачан не полностью \((.+) из (.+)\), будет докачан"), _u(lambda m: f"file downloaded only partly ({m.group(1)} of {m.group(2)}), will be resumed")),
+    (_R(r"кусок (\d+) пришёл не полностью"), r"chunk \1 arrived incomplete"),
+    (_R(r"Повторно запросить код не удалось: (.+)"), r"Couldn't request the code again: \1"),
+    (_R(r"Не удалось получить кастомные эмодзи: (.+)"), r"Couldn't get custom emoji: \1"),
+    (_R(r"Не удалось проверить старую историю группы: (.+)"), r"Couldn't check the group's earlier history: \1"),
+    (_R(r"Не удалось сохранить версию сканирования: (.+)"), r"Couldn't save the scan version: \1"),
+    (_R(r"Не удалось сохранить текущую версию перед пересканированием: (.+)"), r"Couldn't save the current version before rescanning: \1"),
+    (_R(r"Не удалось сохранить прогресс сканирования: (.+)"), r"Couldn't save scan progress: \1"),
+    (_R(r"Не удалось сохранить настройки: (.+)"), r"Couldn't save settings: \1"),
+    (_R(r"Не удалось сохранить состояние: (.+)"), r"Couldn't save state: \1"),
+    (_R(r"Переподключиться пока не удалось: (.+)"), r"Couldn't reconnect yet: \1"),
+    (_R(r"Не удалось связаться.*"), "Couldn't reach Telegram."),
+])
+
+EN_RE.extend([
+    (_R(r"([^:\s][^:]*): (\d+)"), lambda m: f"{tr(m.group(1))}: {m.group(2)}"),
+])
+
+
+def _literal_len(rx):
+    return len(re.sub(r"\(.*?\)|\\.|[.+*?\[\]^$|{}]", "", rx.pattern))
+
+
+EN_RE.sort(key=lambda p: -_literal_len(p[0]))     # сначала самые конкретные шаблоны, общие «… из …» — в конце
+
+
 # =================================== оформление ===================================
 # Своя дизайн-система поверх встроенной темы ttk «clam»: всё рисуется цветами и шрифтами
 # (без картинок), поэтому интерфейс чётко масштабируется при 125–200% и не требует новых пакетов.
@@ -4101,6 +4741,14 @@ class App:
         self.q = queue.Queue()
         self.worker = Worker(self.q)
         self.cfg = load_cfg()
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                if "language" not in json.load(f):
+                    self.cfg["language"] = "ru"      # программа уже стояла на русском — не меняем язык без спроса
+        except (OSError, ValueError):
+            pass
+        set_language(self.cfg.get("language", "system"))
+        install_i18n()
         self.dialogs = []
         self.dialog_map = {}
         self.out_dir = None
@@ -4194,6 +4842,7 @@ class App:
                             for k in ("Личный", "Группа", "Канал")}
         self.v_all_skip = tk.BooleanVar(value=c.get("all_skip_done", True))
         self.v_theme = tk.StringVar(value=c.get("theme", "system"))
+        self.v_language = tk.StringVar(value=c.get("language", "system"))
         self.v_multi_mode = tk.StringVar(value=c.get("multi_mode", "sequential"))
         self.v_details_tab = tk.StringVar(value=c.get("details_tab", "general"))
         self.v_graph_period = tk.StringVar(value=str(c.get("graph_period", "300")))
@@ -4630,7 +5279,7 @@ class App:
         except Exception:
             pass
         cur = self.v_version.get()
-        labels = [o[0] for o in opts]
+        labels = [tr(o[0]) for o in opts]
         self.version_ids = [o[1] for o in opts]
         self.cb_version.configure(values=labels)
         self.v_version.set(cur if cur in labels else labels[0])
@@ -5505,10 +6154,28 @@ class App:
                                                                                pady=S(4))
             ttk.Label(col, text=tip, style="Small.TLabel").grid(row=5 + i, column=2, sticky="w", padx=(S(12), 0))
 
+        self.section(col, "Язык", 11, top=28, colspan=3)
+        ttk.Label(col, text="Язык программы", style="Muted.TLabel").grid(row=12, column=0, sticky="w",
+                                                                       padx=(0, S(16)))
+        Segmented(col, self.v_language, [("system", "Как в системе"), ("ru", "Русский"), ("en", "English")],
+                  command=self.on_language, k=self.ui.k).grid(row=12, column=1, columnspan=2, sticky="w", pady=S(4))
+
         self.section(col, "Оформление", 9, top=28, colspan=3)
         ttk.Label(col, text="Тема", style="Muted.TLabel").grid(row=10, column=0, sticky="w", padx=(0, S(16)))
         Segmented(col, self.v_theme, [("light", "Светлая"), ("dark", "Тёмная"), ("system", "Как в системе")],
                   command=self.on_theme, k=self.ui.k).grid(row=10, column=1, columnspan=2, sticky="w", pady=S(4))
+
+    def on_language(self):
+        self.save_cfg()
+        new = system_lang() if self.v_language.get() == "system" else self.v_language.get()
+        if new == LANG:
+            return
+        if self.busy:
+            messagebox.showinfo("Язык", "Язык изменится после перезапуска программы.", parent=self.root)
+            return
+        if messagebox.askyesno("Язык", "Чтобы сменить язык, программу нужно перезапустить. Перезапустить сейчас?",
+                               parent=self.root):
+            self.on_close(restart=True)
 
     def on_theme(self):
         self.ui.apply(self.theme_mode())
@@ -5638,7 +6305,7 @@ class App:
         set_titlebar_theme(r, self.ui.mode == "dark")
 
     def log(self, text):
-        self.flush_logs([time.strftime("[%H:%M:%S] ") + text + "\n"])
+        self.flush_logs([time.strftime("[%H:%M:%S] ") + tr(text) + "\n"])
 
     def flush_logs(self, lines):
         """Добавляет строки в окно одной операцией (а не по одной) — окно не тормозит."""
@@ -5696,7 +6363,7 @@ class App:
             all_skip_done=self.v_all_skip.get(),
             theme=self.v_theme.get(),
             col_widths=widths, details_tab=self.v_details_tab.get(), details_h=details_h,
-            multi_mode=self.v_multi_mode.get(),
+            multi_mode=self.v_multi_mode.get(), language=self.v_language.get(),
             graph_period=self.v_graph_period.get(),
         )
         return c
@@ -6231,7 +6898,7 @@ class App:
         w = self.report_win
         if w is not None and w.winfo_exists():
             w.destroy()
-        head, _, rest = rep["text"].partition("\n")
+        head, _, rest = tr(rep["text"]).partition("\n")
         d = tk.Toplevel(self.root)
         d.withdraw()
         d.title("Отчёт об экспорте")
@@ -6357,7 +7024,7 @@ class App:
                 handled += 1
                 kind = item[0]
                 if kind == "log":
-                    pending_logs.append(time.strftime("[%H:%M:%S] ") + item[1] + "\n")
+                    pending_logs.append(time.strftime("[%H:%M:%S] ") + tr(item[1]) + "\n")
                     continue
                 self.flush_logs(pending_logs)
                 pending_logs = []
@@ -6594,7 +7261,7 @@ class App:
             pass
         self.root.after(1000, self.tick)
 
-    def on_close(self):
+    def on_close(self, restart=False):
         if self.busy and not messagebox.askyesno(
                 "Выход", "Идёт работа. Остановить и выйти?\n\nПри следующем запуске работа продолжится с того же "
                 "места.", parent=self.root):
@@ -6609,6 +7276,11 @@ class App:
         except Exception:
             pass
         self.root.destroy()
+        if restart:
+            try:
+                subprocess.Popen([sys.executable] + sys.argv, cwd=APP_DIR)
+            except Exception:
+                pass
 
 
 def main():
