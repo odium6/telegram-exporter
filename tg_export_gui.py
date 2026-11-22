@@ -4170,7 +4170,7 @@ class App:
         left.rowconfigure(1, weight=1)
         self.e_search = ttk.Entry(left, textvariable=self.v_search)
         self.e_search.grid(row=0, column=0, sticky="ew", pady=(0, S(10)))
-        self.placeholder(self.e_search, self.v_search, "Поиск чата по названию или ID")
+        self.placeholder(self.e_search, self.v_search, "Найти чат: название, ID, @username или ссылка t.me")
         box, tv = self.make_tree(left, (("name", "Чат", S(340), "w", False), ("kind", "Тип", S(110), "w", False)),
                                  selectmode="browse", key="chats")
         box.grid(row=0 + 1, column=0, sticky="nsew")
@@ -4178,9 +4178,6 @@ class App:
         tv.bind("<<TreeviewSelect>>", self.on_pick_chat)
         tv.bind("<Return>", lambda e: self.b_start.focus_set())
         self.chat_empty = self.empty_state(box)
-        self.e_chat = ttk.Entry(left, textvariable=self.v_manual)
-        self.e_chat.grid(row=2, column=0, sticky="ew", pady=(S(10), 0))
-        self.placeholder(self.e_chat, self.v_manual, "…или введите @username, ссылку t.me или ID чата")
 
         self.vline(body).grid(row=0, column=1, sticky="ns", padx=S(24))
 
@@ -4825,7 +4822,7 @@ class App:
                 self.tv.selection_set(pid)
                 self.tv.see(pid)
             else:
-                self.v_manual.set(pid)
+                self.v_search.set(pid)
             self.v_chat.set(pid)
             self.refresh_versions()
             self.show_page("export")
@@ -5407,15 +5404,33 @@ class App:
                 if iid == cur:
                     tv.selection_set(iid)
                     tv.see(iid)
+        # одно поле: если в списке такого чата нет, а введён @username, ссылка или ID — экспортируем по нему
+        raw = self.v_search.get().strip()
+        if not tv.get_children() and self.looks_like_chat(raw):
+            if self.v_manual.get() != raw:
+                self.v_manual.set(raw)
+        elif self.v_manual.get() and self.v_manual.get() != raw:
+            self._picking = True
+            self.v_manual.set("")
+            self._picking = False
         self.update_chat_empty()
+
+    @staticmethod
+    def looks_like_chat(text):
+        return bool(text) and (text.startswith("@") or "t.me/" in text or "telegram.me/" in text
+                               or re.fullmatch(r"-?\d{5,}", text) is not None)
 
     def update_chat_empty(self):
         if not hasattr(self, "chat_empty"):
             return
         if self.tv.get_children():
             self.chat_empty.hide()
+        elif self.looks_like_chat(self.v_search.get().strip()):
+            self.chat_empty.show("Этого чата нет в списке",
+                                 f"Экспорт пойдёт по адресу «{self.v_search.get().strip()}» — нажмите «Начать экспорт».")
         elif self.dialogs:
-            self.chat_empty.show("Ничего не найдено", "Измените запрос или введите @username, ссылку или ID ниже.")
+            self.chat_empty.show("Ничего не найдено",
+                                 "Измените запрос. Чат не из списка можно указать по @username, ссылке t.me или ID.")
         elif self.connecting:
             self.chat_empty.show("Загружаю список чатов…", "Это займёт несколько секунд.")
         else:
@@ -5680,7 +5695,7 @@ class App:
                     self.update_chat_header()
                     cur = self.v_chat.get().strip()
                     if cur and cur not in self.dialog_map and not self.v_manual.get():
-                        self.v_manual.set(cur)      # прошлый чат был введён вручную — показываем его в поле
+                        self.v_search.set(cur)      # прошлый чат был введён вручную — показываем его в поиске
                     if self.page == "conn":
                         self.show_page("export")
                     if self.v_chat.get() and self.v_chat.get() not in self.counts:
