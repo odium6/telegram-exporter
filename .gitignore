@@ -1,0 +1,14 @@
+# Секреты: вход в аккаунт Telegram и настройки с API hash — никогда не публиковать
+*.session
+*.session-journal
+tg_export_settings.json
+
+# Старые копии программы (история есть в git)
+*_backup.py
+*_before_*.py
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
