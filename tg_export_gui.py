@@ -2289,7 +2289,7 @@ class FloodWaitLog(logging.Handler):
             if m:
                 secs = int(m.group(1))
                 self.worker.note_pause(secs)
-                self.worker.phase(f"⏸ Пауза по требованию Telegram: {secs} с — ограничение частоты запросов, это нормально")
+                self.worker.pause_phase(secs)
                 if time.monotonic() - self.last > 60:
                     self.worker.log(f"⏸ Telegram попросил паузу {secs} с (ограничение частоты запросов). "
                                     "Программа подождёт и продолжит сама.")
@@ -2334,6 +2334,7 @@ class Worker:
         if now_ago(getattr(self, "net_issue_at", -1e9)) < 600:
             self.log("📡 Связь с Telegram восстановлена.")
         self.net_issue_at = -1e9
+        self.restore_phase()
 
     def recheck_now(self):
         """Кнопка «Проверить снова»: не ждать паузу между попытками, а проверить связь сразу."""
@@ -2448,8 +2449,33 @@ class Worker:
             except Exception:
                 pass
 
+    PAUSE_PREFIXES = ("⏸ Пауза по требованию", "📡 Нет связи")
+
     def phase(self, text):
+        self._phase_now = text
+        if not text.startswith(self.PAUSE_PREFIXES):
+            self._phase_base = text            # к этой надписи вернёмся после паузы / обрыва связи
         self.q.put(("phase", text))
+
+    def restore_phase(self, only_if=None):
+        """Пауза закончилась или связь вернулась — убираем устаревшую надпись о ней."""
+        now_t = getattr(self, "_phase_now", None)
+        if now_t is None or not now_t.startswith(self.PAUSE_PREFIXES):
+            return
+        if only_if is not None and now_t != only_if:
+            return
+        base = getattr(self, "_phase_base", None)
+        if base:
+            self.phase(base)
+
+    def pause_phase(self, secs):
+        text = f"⏸ Пауза по требованию Telegram: {secs} с — ограничение частоты запросов, это нормально"
+        self.phase(text)
+        try:
+            self.loop.call_soon_threadsafe(self.loop.call_later, secs + 0.5,
+                                           lambda: self.restore_phase(only_if=text))
+        except RuntimeError:
+            pass
 
     async def ask(self, kind, title, prompt, **kw):
         fut = self.loop.create_future()
@@ -3221,7 +3247,7 @@ class Worker:
             total_msgs = snap_meta["total_msgs"]
             recs_source = os.path.join(out_dir, VERSIONS_DIR, snap_meta["id"], "records.jsonl.gz")
             version_label = snap_meta["created"]
-            self.stats.update(msg_n=total_msgs, msg_total=total_msgs)
+            self.stats.update(msg_n=total_msgs, msg_total=total_msgs, stage="prepare")
             self.log(f"📁 Экспорт из сохранённой версии от {version_label}: {total_msgs} сообщений. "
                      "История из Telegram заново не читается; файлы качаются по этой версии "
                      "(файлы сообщений, удалённых с тех пор, Telegram уже не отдаст).")
@@ -3362,6 +3388,7 @@ class Worker:
                     self.log(f"Не удалось сохранить прогресс сканирования: {e}")
                 recs_f.close()
             self.log(f"Сканирование завершено: {total_msgs} сообщений.")
+            self.stats["stage"] = "prepare"      # дальше — сохранение версии, сводка, проверка скачанного
             self.phase(f"Просканировано сообщений: {total_msgs}")
             version_label = None
             if final:
@@ -3510,6 +3537,7 @@ class Worker:
         async def fetch(msg, src, key, rel, path, size, kind):
             try:
                 attempt = 0
+                refreshed = False
                 t0 = time.monotonic()
                 had = part_bytes(path, size)
                 while True:
@@ -3533,6 +3561,12 @@ class Worker:
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
+                        if cname(e) == "FileReferenceExpiredError" and refreshed:
+                            # сообщение уже перечитано, а Telegram всё равно не отдаёт файл —
+                            # самоуничтожающееся фото/видео или файл удалён; повторять бесполезно
+                            give_up(key, rel, kind, size, path, "Telegram больше не отдаёт этот файл "
+                                    "(самоуничтожающееся фото/видео или файл удалён)")
+                            break
                         attempt += 1
                         if attempt <= retries:
                             self.log(f"Повтор {attempt}/{retries} для сообщения {key} "
@@ -3543,6 +3577,7 @@ class Worker:
                                 attempt -= 1
                             try:   # обновляем сообщение — у старого могла истечь ссылка на файл
                                 fresh = await client.get_messages(src, ids=msg.id)
+                                refreshed = True
                                 if fresh is not None and media_object(fresh) is not None:
                                     msg = fresh
                             except Exception:
@@ -4084,6 +4119,12 @@ EN.update({
     "Список всех чатов со ссылками: index.html. Журнал: _all_chats.log": "List of all chats with links: index.html. Log: _all_chats.log",
     # статусы и журнал
     "ℹ Закрыт незавершённый прошлый сеанс режима экспорта Telegram.": "ℹ Closed an unfinished previous Telegram export mode session.",
+    "Идёт: проверка новых сообщений": "In progress: checking for new messages",
+    "Идёт: подготовка к скачиванию": "In progress: preparing download",
+    "Ждёт связи с Telegram": "Waiting for Telegram connection",
+    "Вырезать": "Cut", "Вставить": "Paste", "Выделить всё": "Select all",
+    "Telegram больше не отдаёт этот файл (самоуничтожающееся фото/видео или файл удалён)":
+        "Telegram no longer provides this file (self-destructing photo/video or deleted file)",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -6454,11 +6495,24 @@ class App:
         for i, (key, _t) in enumerate(self.NAV, start=1):
             r.bind_all(f"<Control-Key-{i}>", lambda e, k=key: self.show_page(k))
         r.bind_all("<Control-KeyPress>", self._ctrl_key, add="+")
+        for cls in ("TEntry", "Entry", "Text", "TCombobox", "TSpinbox"):
+            r.bind_class(cls, "<Button-3>", self._edit_menu, add="+")
         r.bind_all("<F5>", lambda e: self.refresh_exports() if self.page == "exports" else None)
 
     def _ctrl_key(self, e):
         # по коду клавиши, а не символу — работает и в русской раскладке
         kc = getattr(e, "keycode", 0)
+        w = e.widget
+        if isinstance(w, (tk.Entry, tk.Text)):
+            ks = (getattr(e, "keysym", "") or "").lower()
+            clip = {67: ("c", "<<Copy>>"), 86: ("v", "<<Paste>>"), 88: ("x", "<<Cut>>")}
+            if kc in clip:
+                if ks != clip[kc][0]:            # не латинская раскладка — Tk сам не поймёт
+                    w.event_generate(clip[kc][1])
+                return "break" if ks != clip[kc][0] else None
+            if kc == 65:                          # Ctrl+A — выделить всё (в любой раскладке)
+                self._select_all(w)
+                return "break"
         if kc == 70:          # Ctrl+F — поиск чата
             self.show_page("export")
             self.e_search.focus_set()
@@ -6473,6 +6527,47 @@ class App:
             self.on_start()
             return "break"
         return None
+
+    @staticmethod
+    def _select_all(w):
+        try:
+            if isinstance(w, tk.Text):
+                w.tag_add("sel", "1.0", "end-1c")
+                w.mark_set("insert", "end-1c")
+            else:
+                w.selection_range(0, "end")
+                w.icursor("end")
+        except tk.TclError:
+            pass
+
+    def _edit_menu(self, e):
+        """Меню правой кнопки в полях ввода и журнале: вырезать / копировать / вставить / выделить всё."""
+        w = e.widget
+        if not isinstance(w, (tk.Entry, tk.Text)):
+            return
+        try:
+            w.focus_set()
+        except tk.TclError:
+            pass
+        readonly = isinstance(w, tk.Text) and str(w.cget("state")) == "disabled"
+        try:
+            readonly = readonly or str(w.cget("state")) in ("disabled", "readonly")
+        except tk.TclError:
+            pass
+        m = tk.Menu(self.root, tearoff=0)
+        c = self.ui.c
+        m.configure(background=c["field"], foreground=c["text"], activebackground=c["accent_soft"],
+                    activeforeground=c["text"], disabledforeground=c["faint"], relief="flat", bd=1)
+        st = "disabled" if readonly else "normal"
+        m.add_command(label="Вырезать", state=st, command=lambda: w.event_generate("<<Cut>>"))
+        m.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
+        m.add_command(label="Вставить", state=st, command=lambda: w.event_generate("<<Paste>>"))
+        m.add_separator()
+        m.add_command(label="Выделить всё", command=lambda: self._select_all(w))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     def _place_window(self):
         r, S = self.root, self.S
@@ -7342,7 +7437,7 @@ class App:
                 pct = min(1.0, mn / mt)
                 self.stat["msgs"].configure(
                     text=f"{mn:,} из {mt:,} ({pct * 100:.0f}%)".replace(",", " ")
-                    + (f" · {mrate:,.0f}/с".replace(",", " ") if mrate else " · пауза"))
+                    + (f" · {mrate:,.0f}/с".replace(",", " ") if mrate else ("" if mn >= mt else " · пауза")))
                 live["pct"] = f"{pct * 100:.0f}%"
             else:
                 self.stat["msgs"].configure(text=f"просканировано {mn:,}".replace(",", " "))
@@ -7356,8 +7451,9 @@ class App:
                 self.stat["eta"].configure(text="считаю…" if mt else "—")
                 self.stat["finish"].configure(text="считаю…" if mt else "—")
                 live["eta"] = ""
-            live["status"] = "Идёт: сканирование"
-            live["speed"] = f"{mrate:,.0f} сообщ./с".replace(",", " ") if mrate else "пауза"
+            done_scan = bool(mt) and mn >= mt          # всё прочитано — проверяются только новые сообщения
+            live["status"] = "Идёт: проверка новых сообщений" if done_scan else "Идёт: сканирование"
+            live["speed"] = f"{mrate:,.0f} сообщ./с".replace(",", " ") if mrate else ("" if done_scan else "пауза")
         elif mt:
             self.stat["msgs"].configure(text=f"{mn:,} из {mt:,}".replace(",", " "))
         if st["running"] and stage == "download" and p.total <= 0:
@@ -7406,6 +7502,12 @@ class App:
                 live["eta"] = ""
         if st["running"] and stage == "finish":
             live.update(status="Идёт: сборка HTML и JSON", speed="", eta="")
+        if st["running"] and stage == "prepare":
+            live.update(status="Идёт: подготовка к скачиванию", speed="", eta="")
+            self.stat["eta"].configure(text="—")
+            self.stat["finish"].configure(text="—")
+        if st["running"] and now - getattr(self.worker, "net_issue_at", -1e9) < 90:
+            live.update(status="Ждёт связи с Telegram", speed="")
         if st.get("chat_total"):
             nm = st.get("chat_name", "")
             nm = nm if len(nm) <= 22 else nm[:21] + "…"
@@ -7481,14 +7583,30 @@ class App:
                 pass
 
 
+ICON_PATH = os.path.join(APP_DIR, "app_icon.ico")
+
+
+def set_app_icon(root):
+    """Иконка окна и панели задач (файл app_icon.ico рядом с программой; нет файла — обычная)."""
+    if not os.path.exists(ICON_PATH):
+        return
+    try:
+        root.iconbitmap(default=ICON_PATH)       # default — и для всех диалогов программы
+    except tk.TclError:
+        pass
+
+
 def main():
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # чёткий шрифт на Windows
+        # своя «кнопка» на панели задач — с иконкой программы, а не Python
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TelegramExporter.App")
     except Exception:
         pass
     root = tk.Tk()
     root.withdraw()            # окно появляется уже собранным — без мигания при построении
+    set_app_icon(root)
     App(root)
     root.deiconify()
     root.mainloop()
