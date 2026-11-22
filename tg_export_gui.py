@@ -2231,7 +2231,12 @@ class FloodWaitLog(logging.Handler):
 
     def emit(self, record):
         try:
-            m = re.search(r"Sleeping for (\d+)s", record.getMessage())
+            text = record.getMessage()
+            if re.search(r"connecting failed|Connection closed|closed the connection|Can't connect|"
+                         r"Connection reset|timed out|Error while connecting", text, re.I):
+                self.worker.net_issue(text)
+                return
+            m = re.search(r"Sleeping for (\d+)s", text)
             if m:
                 secs = int(m.group(1))
                 self.worker.note_pause(secs)
@@ -2263,6 +2268,17 @@ class Worker:
         self.alogf = None
         self.scan_info = None
         threading.Thread(target=self._run, daemon=True).start()
+
+    # ---- связь ----
+    def net_issue(self, detail=""):
+        """Telethon не может связаться с Telegram — говорим об этом понятно, а не молча ждём."""
+        now = time.monotonic()
+        self.net_issue_at = now
+        self.phase("📡 Нет связи с Telegram — проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси. Программа продолжит сама, когда связь появится.")
+        if now - getattr(self, "_net_last_log", -1e9) > 60:
+            self._net_last_log = now
+            self.log("📡 Не удаётся связаться с Telegram (" + str(detail)[:120] + "). Похоже, нет интернета, "
+                     "выключен VPN или не запущен прокси. Программа продолжит сама, когда связь появится.")
 
     # ---- паузы Telegram и прогноз окончания сканирования ----
     def scan_begin(self, n0):
@@ -4379,10 +4395,18 @@ class App:
         self.l_phase = ttk.Label(g, text="", style="Value.TLabel", justify="left")
         self.l_phase.grid(row=0, column=0, sticky="w")
         g.bind("<Configure>", lambda e: self.l_phase.configure(wraplength=max(S(240), e.width - S(8))), add="+")
+        self.net_warn = ttk.Frame(g)
+        self.l_net_warn = ttk.Label(self.net_warn, text="", style="Warning.TLabel", justify="left")
+        self.l_net_warn.pack(side="left")
+        ttk.Button(self.net_warn, text="Настройки подключения", style="Link.TButton",
+                   command=lambda: self.show_page("conn")).pack(side="left", padx=(S(8), 0))
+        self.net_warn.grid(row=1, column=0, sticky="w", pady=(S(6), 0))
+        self.net_warn.grid_remove()
+        g.bind("<Configure>", lambda e: self.l_net_warn.configure(wraplength=max(S(240), e.width - S(260))), add="+")
         self.pb = ttk.Progressbar(g, mode="determinate", maximum=1000)
-        self.pb.grid(row=1, column=0, sticky="ew", pady=(S(10), S(10)))
+        self.pb.grid(row=2, column=0, sticky="ew", pady=(S(10), S(10)))
         sf = ttk.Frame(g)
-        sf.grid(row=2, column=0, sticky="ew")
+        sf.grid(row=3, column=0, sticky="ew")
         self.stats_frame = sf
         self.stat = {}
         self.stat_cells = []
@@ -4396,7 +4420,7 @@ class App:
         g.bind("<Configure>", lambda e: self.layout_stats(3 if e.width >= S(900) else 2), add="+")
         self.l_idle = ttk.Label(g, text="Здесь появится ход экспорта: прогресс, скорость, прогноз окончания и журнал.",
                                 style="Muted.TLabel")
-        self.l_idle.grid(row=3, column=0, sticky="w", pady=(S(4), 0))
+        self.l_idle.grid(row=4, column=0, sticky="w", pady=(S(4), 0))
 
         sp = ttk.Frame(stack)
         sp.grid(row=0, column=0, sticky="nsew")
@@ -4521,6 +4545,36 @@ class App:
         poly = [(pts[0][0], base)] + pts + [(pts[-1][0], base)]
         cv.create_polygon(*[k for p in poly for k in p], fill=c["accent_soft"], outline="")
         cv.create_line(*[k for p in pts for k in p], fill=c["accent"], width=max(1, S(2)))
+
+    QUIET_PHASES = ("⏸", "Пауза", "Сохраняю", "Создаю", "Собираю", "Проверяю", "Докачиваю", "Кастомные")
+    NET_HINT = "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси"
+
+    def watchdog(self, now, st, p):
+        """Если долго ничего не меняется — скорее всего нет связи; подсказываем, что проверить."""
+        sig = (st.get("stage"), st.get("msg_n"), p.n, st.get("ok"), self.l_phase.cget("text"))
+        if sig != getattr(self, "_wd_sig", None):
+            self._wd_sig, self._wd_t = sig, now
+        stalled = now - getattr(self, "_wd_t", now)
+        si = getattr(self.worker, "scan_info", None) or {}
+        net_recent = now - getattr(self.worker, "net_issue_at", -1e9) < 90
+        quiet = self.l_phase.cget("text").startswith(self.QUIET_PHASES) or si.get("pause_until", 0) > now             or st.get("stage") == "finish"
+        warn = ""
+        if self.busy and self.stoppable and not self.connecting and (net_recent or (stalled > 45 and not quiet)):
+            secs = int(stalled)
+            warn = ("Нет связи с Telegram" if net_recent else f"Telegram не отвечает уже {fmt_left(secs)[1:]}") +                 f" — {self.NET_HINT}. Ничего не потеряется: программа продолжит сама, когда связь появится."
+        if warn:
+            self.l_net_warn.configure(text=warn)
+            self.net_warn.grid()
+        else:
+            self.net_warn.grid_remove()
+        # подключение: долго нет ответа
+        if self.connecting and self.busy and now - getattr(self, "connect_t", now) > 20 and not self.account:
+            msg = "Telegram долго не отвечает — " + self.NET_HINT + ". Можно нажать «Отмена», поменять настройки и подключиться снова."
+            if self.l_conn_hint.cget("text") != msg:
+                self.l_conn_hint.configure(text=msg, style="Warning.TLabel")
+            if self.chat_empty.shown and self.chat_empty.shown.startswith(("Загружаю", "Нет ответа")):
+                self.chat_empty.show("Нет ответа от Telegram", "Проверьте, что включён VPN или запущен прокси.",
+                                     ("Перейти к подключению", lambda: self.show_page("conn")))
 
     def update_live_row(self):
         """Строка текущего экспорта в таблице обновляется каждую секунду — как в торрент-клиентах."""
@@ -4886,7 +4940,7 @@ class App:
         self.l_acc_dot.configure(style=dot)
         self.l_acc_name.configure(text=name)
         self.l_conn_status.configure(text=status, style="Value.TLabel")
-        self.l_conn_hint.configure(text=hint)
+        self.l_conn_hint.configure(text=hint, style="Muted.TLabel")
         self.b_connect.configure(text="Переподключиться" if self.account else "Подключиться",
                                  state="disabled" if self.busy else "normal")
         can_logout = (self.account or os.path.exists(SESSION_PATH + ".session")) and not self.busy
@@ -5188,6 +5242,7 @@ class App:
             return
         self.save_cfg()
         self.connecting = True
+        self.connect_t = time.monotonic()
         self.set_busy(True, stoppable=True)
         self.update_chat_empty()
         self.job = self.worker.submit(self.worker.connect(dict(cfg)))
@@ -5773,6 +5828,7 @@ class App:
         except Exception:
             pass
         self.live = live if st["running"] else None
+        self.watchdog(now, st, p)
         # пункт меню «Мои экспорты» показывает ход работы с любой страницы
         nav = f"Мои экспорты  ·  {int(self.pb['value']) // 10}%" if st["running"] and stage in ("scan", "download") \
             else ("Мои экспорты  ·  идёт" if st["running"] and stage else "Мои экспорты")
