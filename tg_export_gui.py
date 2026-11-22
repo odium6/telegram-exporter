@@ -61,6 +61,7 @@ DEFAULTS = {
     "details_h": 0,             # высота панели деталей (0 — по содержимому)
     "graph_period": "300",
     "col_widths": {},           # ширина колонок таблиц, которую выставил пользователь
+    "multi_mode": "sequential", # несколько чатов: по очереди / сначала сканировать все
 }
 
 KIND_NAMES = {
@@ -2071,25 +2072,35 @@ def save_snapshot(out_dir, recs_path, nbytes, meta):
     return vid, meta["created"]
 
 
+_CHAT_DIRS = {}
+
+
 def find_chat_dirs(out_root, chat):
-    """Папки экспорта чата по его ID из списка чатов (там лежит .chat_id)."""
+    """Папки экспорта чата по его ID из списка чатов (там лежит .chat_id).
+    Карта «ID → папки» строится один раз и обновляется, только когда в папке экспорта что-то добавилось."""
     try:
         from telethon.utils import resolve_id
         real = str(resolve_id(int(chat))[0])
     except Exception:
         return []
-    res = []
     try:
-        for n in os.listdir(out_root):
-            try:
-                with open(os.path.join(out_root, n, ".chat_id"), encoding="utf-8") as f:
-                    if f.read().strip() == real:
-                        res.append(os.path.join(out_root, n))
-            except OSError:
-                pass
+        mt = os.path.getmtime(out_root)
     except OSError:
-        pass
-    return res
+        return []
+    hit = _CHAT_DIRS.get(out_root)
+    if not hit or hit[0] != mt or real not in hit[1]:   # новый чат мог появиться внутри уже известной папки
+        index = {}
+        try:
+            for n in os.listdir(out_root):
+                try:
+                    with open(os.path.join(out_root, n, ".chat_id"), encoding="utf-8") as f:
+                        index.setdefault(f.read().strip(), []).append(os.path.join(out_root, n))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        hit = _CHAT_DIRS[out_root] = (mt, index)
+    return list(hit[1].get(real, []))
 
 
 STATUS_ORDER = {"running": 0, "scan": 1, "partial": 2, "nodl": 3, "nohtml": 4, "old": 5,
@@ -2177,8 +2188,33 @@ def friendly_error(err):
     return err[:80]
 
 
+_STATUS_CACHE = {}
+
+
+def _status_key(d, types, limit_mb):
+    """Отпечаток папки по времени изменения нескольких файлов: если ничего не менялось — пересчитывать не нужно."""
+    sig = [json.dumps(types, sort_keys=True), limit_mb]
+    for fn in ("scan_cache.json", "done.txt", "failed.txt", "messages.html", "export.log", VERSIONS_DIR):
+        try:
+            sig.append(os.path.getmtime(os.path.join(d, fn)))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
+def chat_status_cached(d, types, limit_mb):
+    key = _status_key(d, types, limit_mb)
+    hit = _STATUS_CACHE.get(d)
+    if hit and hit[0] == key:
+        return dict(hit[1])
+    row = chat_status(d, types, limit_mb)
+    _STATUS_CACHE[d] = (key, dict(row))
+    return row
+
+
 def scan_exports(out_root, types, limit_mb):
-    """Все чаты в папке экспорта + чаты из «экспорта всех», которые завершились ошибкой."""
+    """Все чаты в папке экспорта + чаты из «экспорта всех», которые завершились ошибкой.
+    Неизменившиеся папки берутся из кэша — большой scan_cache.json не перечитывается каждые 20 секунд."""
     rows, seen = [], set()
     try:
         names = os.listdir(out_root)
@@ -2188,7 +2224,7 @@ def scan_exports(out_root, types, limit_mb):
         d = os.path.join(out_root, n)
         if os.path.isdir(d) and os.path.exists(os.path.join(d, ".chat_id")):
             try:
-                row = chat_status(d, types, limit_mb)
+                row = chat_status_cached(d, types, limit_mb)
                 rows.append(row)
                 seen.add(os.path.normcase(os.path.abspath(d)))
             except Exception:
@@ -2263,7 +2299,7 @@ class Worker:
         tl.addHandler(FloodWaitLog(self))
         self.stats = {"ok": 0, "failed": 0, "total_files": 0, "running": False,
                       "stage": "", "msg_n": 0, "msg_total": 0,
-                      "chat_i": 0, "chat_total": 0, "chat_name": ""}
+                      "chat_i": 0, "chat_total": 0, "chat_name": "", "disk_low": 0}
         self.logf = None
         self.alogf = None
         self.scan_info = None
@@ -2604,7 +2640,8 @@ class Worker:
             else:
                 self.log(f"ℹ Режим экспорта Telegram не включился ({e}). Экспорт идёт в обычном режиме.")
 
-    async def _export_loop(self, cfg, chat, report_window=True, max_attempts=100, confirm=True, version=None):
+    async def _export_loop(self, cfg, chat, report_window=True, max_attempts=100, confirm=True, version=None,
+                           **kw):
         """Повторяет экспорт чата после сбоев; каждый повтор продолжает с места остановки.
         Пока нет связи с Telegram — просто ждёт её, попытки при этом не тратятся."""
         attempt = 0
@@ -2612,7 +2649,7 @@ class Worker:
         while True:
             try:
                 return await self.export(cfg, chat, confirm=(confirm and first), report_window=report_window,
-                                         version=version)
+                                         version=version, **kw)
             except (StopRequested, ValueError, asyncio.CancelledError):
                 raise
             except FloodWaitError as e:
@@ -2655,9 +2692,12 @@ class Worker:
                 pass
 
     async def export_all(self, cfg, chats):
-        """Экспорт всех выбранных чатов подряд. Состояние хранится в _all_chats_state.json:
-        после сбоя, «Стоп» или перезапуска программы продолжает с того чата, на котором остановился
-        (а внутри чата — с того сообщения/файла). Ошибка в одном чате не останавливает остальные."""
+        """Экспорт нескольких чатов. Состояние хранится в _all_chats_state.json: после сбоя, «Стоп» или
+        перезапуска продолжает с того чата, где остановился (а внутри чата — с того сообщения/файла).
+        Ошибка в одном чате не останавливает остальные.
+        cfg["multi_mode"]: "sequential" — каждый чат сканируется и сразу скачивается;
+                           "scan_first" — сначала сканируются все, потом (после общей сводки) скачиваются.
+        cfg["auto_download"]: False — перед скачиванием показать сводку и спросить."""
         from contextlib import AsyncExitStack
         import datetime as _dt
         root = cfg["out_root"]
@@ -2682,24 +2722,30 @@ class Worker:
         self.alogf = open(os.path.join(root, "_all_chats.log"), "a", encoding="utf-8", buffering=1)
         started = time.time()
         skip = cfg.get("all_skip_done", True)
+        mode = cfg.get("multi_mode", "sequential")
+        auto = cfg.get("auto_download", True)
         todo = [c for c in chats
                 if not (skip and state["chats"].get(str(c[0]), {}).get("status") == "done")]
         skipped = len(chats) - len(todo)
-        self.alog(f"━━━ Экспорт всех чатов: выбрано {len(chats)}"
+        self.alog(f"━━━ Экспорт чатов: выбрано {len(chats)}"
                   + (f", уже готовы и пропускаются: {skipped}" if skipped else "")
-                  + f", к экспорту: {len(todo)} ━━━")
+                  + f", к экспорту: {len(todo)}; порядок: "
+                  + ("сначала сканировать все, потом скачивать" if mode == "scan_first" else "по очереди")
+                  + ("" if auto else "; перед скачиванием — сводка") + " ━━━")
         stack = AsyncExitStack()
         self.hist = None
         stopped = False
-        try:
-            await self._open_takeout(stack, cfg)
-            rounds = [todo]
+
+        async def run_list(lst, label, **kw):
+            """Проходит по чатам (с одним повтором тех, где был временный сбой). Возвращает {cid: результат}."""
+            results = {}
+            rounds = [lst]
             for rnd in (1, 2):
                 retry = []
-                lst = rounds[-1]
-                for i, (cid, name, kind) in enumerate(lst, 1):
-                    self.stats.update(chat_i=i, chat_total=len(lst), chat_name=name)
-                    self.alog(f"━━ Чат {i} из {len(lst)}" + (" (повтор)" if rnd == 2 else "") +
+                cur = rounds[-1]
+                for i, (cid, name, kind) in enumerate(cur, 1):
+                    self.stats.update(chat_i=i, chat_total=len(cur), chat_name=name)
+                    self.alog(f"━━ {label} {i} из {len(cur)}" + (" (повтор)" if rnd == 2 else "") +
                               f": {name} [{kind}]")
                     self.session = {"started": time.time(), "restarts": 0, "bytes": 0, "dl_seconds": 0.0,
                                     "failed": {}, "chat": cid}
@@ -2708,22 +2754,27 @@ class Worker:
                                at=f"{_dt.datetime.now():%d.%m.%Y %H:%M}")
                     save_state()
                     try:
-                        res = await self._export_loop(cfg, str(cid), report_window=False,
-                                                      max_attempts=5, confirm=False)
-                        ent.update(status="done" if res["complete"] else "partial",
-                                   out_dir=res["out_dir"], msgs=res["msgs"],
-                                   files_ok=res["ok"], files_want=res["want"], error="")
-                        self.alog(("✅" if res["complete"] else "⚠") +
-                                  f" {name}: сообщений {res['msgs']}, файлов {res['ok']} из {res['want']}")
+                        res = await self._export_loop(cfg, str(cid), report_window=False, max_attempts=5, **kw)
+                        results[cid] = res
+                        if res.get("scan_only"):
+                            ent.update(status="scanned", out_dir=res["out_dir"], msgs=res["msgs"],
+                                       files_ok=res["ok"], files_want=res["want"], error="")
+                            self.alog(f"🔎 {name}: сообщений {res['msgs']}, к скачиванию файлов {res['files']} "
+                                      f"({human(res['need'])})")
+                        else:
+                            ent.update(status="done" if res["complete"] else "partial",
+                                       out_dir=res["out_dir"], msgs=res["msgs"],
+                                       files_ok=res["ok"], files_want=res["want"], error="")
+                            self.alog(("✅" if res["complete"] else "⚠") +
+                                      f" {name}: сообщений {res['msgs']}, файлов {res['ok']} из {res['want']}")
                     except (StopRequested, asyncio.CancelledError):
                         ent["status"] = "stopped"
                         save_state()
-                        stopped = True
                         raise
                     except Exception as e:
                         perm = is_permanent_error(e) or isinstance(e, ValueError)
                         ent.update(status="failed", error=f"{type(e).__name__}: {e}")
-                        self.alog(f"❌ {name}: не удалось экспортировать ({e}). Перехожу к следующему чату"
+                        self.alog(f"❌ {name}: не удалось ({e}). Перехожу к следующему чату"
                                   + ("." if perm else " — в конце попробую этот чат ещё раз."))
                         if not perm:
                             retry.append((cid, name, kind))
@@ -2732,6 +2783,46 @@ class Worker:
                     break
                 self.alog(f"Повторяю чаты, где были сбои: {len(retry)}")
                 rounds.append(retry)
+            return results
+
+        try:
+            await self._open_takeout(stack, cfg)
+            if mode == "scan_first":
+                scanned = await run_list(todo, "Сканирование чата", confirm=False, scan_only=True)
+                ready = [c for c in todo if c[0] in scanned]
+                files = sum(r["files"] for r in scanned.values())
+                need = sum(r["need"] for r in scanned.values())
+                lines = [f"Все чаты просканированы: {len(scanned)} из {len(todo)}.", "",
+                         f"К скачиванию: {files} файлов, {human(need)}."]
+                big = sorted(scanned.items(), key=lambda kv: -kv[1]["need"])
+                names = {c[0]: c[1] for c in todo}
+                for cid, r in big[:15]:
+                    if r["files"]:
+                        lines.append(f"  {names.get(cid, cid)}: {r['files']} файлов, {human(r['need'])}")
+                if sum(1 for _, r in big if r["files"]) > 15:
+                    lines.append("  …")
+                free = free_space(root)
+                reserve = int(cfg["disk_reserve_mb"]) * 1024 * 1024
+                lines.append("")
+                lines.append(f"Свободно на диске: {human(free)}.")
+                if need + reserve > free:
+                    lines.append(f"⚠ Места не хватит: нужно ещё ~{human(need + reserve - free)}. Скачивание начнётся; "
+                                 "когда место кончится, оно встанет на паузу до тех пор, пока вы его не освободите.")
+                summary = "\n".join(lines)
+                self.alog(summary)
+                go = True
+                if files and not auto:
+                    go = await self.ask("yesno", "Скачать файлы всех чатов?", summary + "\n\nНачать скачивание?")
+                if go:
+                    self.alog("▶ Скачиваю файлы чатов по очереди.")
+                    await run_list(ready, "Скачивание чата", confirm=False)
+                else:
+                    self.alog("⏹ Скачивание файлов отложено. Чаты просканированы — продолжить можно в «Моих экспортах».")
+            else:
+                await run_list(todo, "Чат", confirm=not auto, decline="skip_files")
+        except (StopRequested, asyncio.CancelledError):
+            stopped = True
+            raise
         finally:
             self.hist = None
             try:
@@ -2763,6 +2854,8 @@ class Worker:
             L.append(f"  тексты сохранены, но не все файлы скачаны: {cnt['partial']}")
         if cnt.get("failed"):
             L.append(f"  не удалось экспортировать: {cnt['failed']}")
+        if cnt.get("scanned"):
+            L.append(f"  просканированы, файлы ещё не скачаны: {cnt['scanned']}")
         bad = [e for e in sel if e.get("status") in ("failed", "partial")]
         if bad:
             L.append("")
@@ -2811,7 +2904,8 @@ class Worker:
         return {"text": text, "complete": cnt.get("done", 0) == len(sel), "out_dir": root,
                 "has_failed": False, "html": has_index, "html_file": "index.html", "all": True}
 
-    async def export(self, cfg, chat, confirm=True, report_window=True, version=None):
+    async def export(self, cfg, chat, confirm=True, report_window=True, version=None, scan_only=False,
+                     decline="stop"):
         """version: None — досканировать новые сообщения; "full" — пересканировать всю историю
         (получится новая версия); иначе — id сохранённой версии: экспорт из неё без чтения истории."""
         global SIZE_LIMIT_MB, MESSAGES_PER_PAGE, MISSING_REASON, STALL_TIMEOUT, THREADS_PER_FILE
@@ -3160,19 +3254,31 @@ class Worker:
         if need + reserve <= free:
             lines.append(f"Места хватает (останется ~{human(free - need)}).")
         else:
-            lines.append(f"\n⚠ МЕСТА НЕ ХВАТИТ: нужно ~{human(need + reserve)}. "
-                         "Загрузка остановится, когда место кончится, но тексты и HTML сохранятся.")
+            lines.append(f"\n⚠ МЕСТА НЕ ХВАТИТ: нужно ещё ~{human(need + reserve - free)}. Скачивание начнётся; "
+                         "когда место кончится, оно встанет на паузу и продолжится само, как только вы освободите место.")
         summary = "\n".join(lines)
         self.log(summary)
+        if scan_only:          # режим «сначала сканировать все чаты»: файлы — позже, после общей сводки
+            self.phase(f"Просканирован: {title}")
+            return {"scan_only": True, "title": title, "out_dir": out_dir, "msgs": total_msgs,
+                    "files": len(todo), "need": max(0, need), "complete": not todo,
+                    "ok": len(wanted) - len(todo), "want": len(wanted)}
         if todo and confirm and not cfg.get("auto_download", True):
-            if not await self.ask("yesno", "Начать загрузку?", summary + "\n\nНачать?"):
-                raise StopRequested()
+            question = summary + ("\n\nСкачать файлы этого чата?\n«Нет» — пропустить файлы этого чата "
+                                  "(тексты и HTML сохранятся, файлы можно докачать позже)."
+                                  if decline == "skip_files" else "\n\nНачать?")
+            if not await self.ask("yesno", "Начать загрузку?", question):
+                if decline != "skip_files":
+                    raise StopRequested()
+                self.log("⏭ Файлы этого чата пропущены по вашему выбору — их можно докачать позже.")
+                todo, todo_bytes, partial_bytes = {}, 0, 0
         elif todo and confirm:
             self.log("▶ Скачивание начинается сразу (настройка «Сразу скачивать после сканирования»).")
 
         # --- 2. загрузка файлов: сообщения с файлами запрашиваются по id пачками по 100,
         # историю заново читать не нужно ---
         st = {"pending": 0, "disk_full": False}
+        self.stats["disk_low"] = 0
         status_of = {}
         self.stats.update(ok=len(wanted) - len(todo), failed=0, total_files=len(wanted),
                           stage="download", msg_n=total_msgs, msg_total=total_msgs)
@@ -3209,6 +3315,27 @@ class Worker:
                 failf.write(f"{key}\t{kind}\t{size}\t{reason!r}\n")
                 failf.flush()
                 sess["failed"][key] = (rel, kind, size, str(reason) or "ошибка")
+
+        async def wait_for_space(need_now):
+            """Места не хватает — скачивание на паузе, пока его не освободят (проверка раз в 5 с:
+            один системный вызов, диск не сканируется). Освободили — продолжаем сами."""
+            while free_space(out_dir) < need_now + st["pending"] + reserve:
+                if st["pending"] > 0 and tasks:          # сначала дождёмся файлов, которые уже качаются
+                    await asyncio.wait(list(tasks), timeout=5, return_when=asyncio.FIRST_COMPLETED)
+                    continue
+                lack = need_now + reserve - free_space(out_dir)
+                self.stats["disk_low"] = max(1, lack)
+                if not st["disk_full"]:
+                    st["disk_full"] = True
+                    self.log(f"⛔ Не хватает места на диске: нужно ещё {human(lack)}. Скачивание на паузе — "
+                             "освободите место, и оно продолжится само.")
+                self.phase(f"⛔ Не хватает места на диске — освободите ещё {human(lack)}, скачивание продолжится само.")
+                await asyncio.sleep(5)
+            if st["disk_full"]:
+                st["disk_full"] = False
+                self.stats["disk_low"] = 0
+                self.log("✅ Место на диске появилось — продолжаю скачивание.")
+                self.phase("Загрузка...")
 
         async def fetch(msg, src, key, rel, path, size, kind):
             try:
@@ -3278,14 +3405,7 @@ class Worker:
                         if msg is None or media_object(msg) is None:
                             give_up(key, rel, kind, size, path, "сообщение удалено или файл больше недоступен")
                             continue
-                        if st["disk_full"] or \
-                                free_space(out_dir) < size - part_bytes(path, size) + st["pending"] + reserve:
-                            if not st["disk_full"]:
-                                self.log("⛔ Закончилось место на диске — дальше файлы не качаются, "
-                                         "но тексты и HTML будут сохранены.")
-                            st["disk_full"] = True
-                            give_up(key, rel, kind, size, path, "нет места", status="no_space")
-                            continue
+                        await wait_for_space(size - part_bytes(path, size))
                         await sem.acquire()
                         st["pending"] += size
                         t = asyncio.create_task(fetch(msg, src, key, rel, path, size, kind))
@@ -3295,6 +3415,7 @@ class Worker:
                 self.phase("Докачиваю последние файлы...")
                 await asyncio.gather(*list(tasks))
         finally:
+            self.stats["disk_low"] = 0
             pend = [t for t in tasks if not t.done()]
             for t in pend:
                 t.cancel()
@@ -3572,26 +3693,32 @@ class UI:
             return best - width / 2
         return d
 
-    def _paint(self, name, w, h, bg, layers):
+    def _paint(self, name, w, h, bg, layers, transparent=False):
         """layers: [(цвет, функция-расстояние)] поверх фона bg. Картинка переиспользуется при смене темы."""
         img = self._imgs.get(name)
         if img is None:
             img = self._imgs[name] = tk.PhotoImage(master=self.root, width=w, height=h)
         base = self._rgb(bg)
         cols = [(self._rgb(c), f) for c, f in layers]
-        rows = []
+        rows, clear = [], []
         for y in range(h):
             row = []
             for x in range(w):
                 r, g, b = base
                 px, py = x + 0.5, y + 0.5
+                hit = False
                 for (cr, cg, cb), f in cols:
                     a = self._cov(f(px, py))
                     if a:
+                        hit = True
                         r, g, b = r + (cr - r) * a, g + (cg - g) * a, b + (cb - b) * a
+                if transparent and not hit:
+                    clear.append((x, y))
                 row.append("#%02x%02x%02x" % (int(r + 0.5), int(g + 0.5), int(b + 0.5)))
             rows.append("{" + " ".join(row) + "}")
         img.put(" ".join(rows), to=(0, 0))
+        for x, y in clear:
+            img.transparency_set(x, y, True)
         return img
 
     def _draw_elements(self):
@@ -3616,6 +3743,13 @@ class UI:
             "on_h": check("cb_on_h", c["accent_hover"], c["accent_hover"], c["accent_text"]),
             "off_d": check("cb_off_d", c["border"], c["bg"]),
             "on_d": check("cb_on_d", c["border_strong"], c["border_strong"], c["bg"]),
+        }
+        # флажки для строк таблицы (фон прозрачный)
+        self.tree_cb = {
+            "off": self._paint("tcb_off", sz, sz, c["bg"], [(c["border_strong"], box), (c["field"], inner)], True),
+            "on": self._paint("tcb_on", sz, sz, c["bg"], [(c["accent"], box), (c["accent"], inner),
+                                                          (c["accent_text"], lambda x, y: max(tick(x, y), inner(x, y)))],
+                              True),
         }
         # стрелка выпадающего списка
         aw, ah = self.s(28), self.s(14)
@@ -3928,6 +4062,7 @@ class App:
                             for k in ("Личный", "Группа", "Канал")}
         self.v_all_skip = tk.BooleanVar(value=c.get("all_skip_done", True))
         self.v_theme = tk.StringVar(value=c.get("theme", "system"))
+        self.v_multi_mode = tk.StringVar(value=c.get("multi_mode", "sequential"))
         self.v_details_tab = tk.StringVar(value=c.get("details_tab", "general"))
         self.v_graph_period = tk.StringVar(value=str(c.get("graph_period", "300")))
         self.v_ex_filter = tk.StringVar(value=self.EX_FILTERS[0])
@@ -3994,7 +4129,7 @@ class App:
                 pass
         return setter
 
-    def make_tree(self, parent, cols, selectmode, hscroll=False, height=6, key=None):
+    def make_tree(self, parent, cols, selectmode, hscroll=False, height=6, key=None, checkbox=False):
         """Таблица с колонками фиксированной ширины: ширину можно менять, перетаскивая границу заголовка,
         она запоминается. Лишнее место забирает пустая последняя колонка — колонки не разъезжаются."""
         S = self.S
@@ -4004,7 +4139,10 @@ class App:
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
         names = [x[0] for x in cols]
-        tv = ttk.Treeview(box, columns=names + ["_pad"], show="headings", selectmode=selectmode, height=height)
+        tv = ttk.Treeview(box, columns=names + ["_pad"], show="tree headings" if checkbox else "headings",
+                          selectmode=selectmode, height=height)
+        if checkbox:
+            tv.column("#0", width=S(40), minwidth=S(40), stretch=False, anchor="center")
         saved = ((self.cfg.get("col_widths") or {}).get(key) or {}) if key else {}
         for k, t, w, a, _stretch in cols:
             tv.heading(k, text=t, anchor=a)
@@ -4160,6 +4298,8 @@ class App:
         body, actions, sub = self._page("export", "Экспорт")
         self.b_all = ttk.Button(actions, text="Экспорт всех чатов…", command=self.on_start_all)
         self.b_all.pack(side="right")
+        self.b_uncheck = ttk.Button(actions, text="Снять отметки", style="Link.TButton",
+                                    command=lambda: self.set_checks(set()))
         body.columnconfigure(0, weight=1)
         body.columnconfigure(2, minsize=S(330))
         body.rowconfigure(0, weight=1)
@@ -4172,10 +4312,14 @@ class App:
         self.e_search.grid(row=0, column=0, sticky="ew", pady=(0, S(10)))
         self.placeholder(self.e_search, self.v_search, "Найти чат: название, ID, @username или ссылка t.me")
         box, tv = self.make_tree(left, (("name", "Чат", S(340), "w", False), ("kind", "Тип", S(110), "w", False)),
-                                 selectmode="browse", key="chats")
+                                 selectmode="extended", key="chats", checkbox=True)
+        tv.heading("#0", image=self.ui.tree_cb["off"], command=self.toggle_all_checks)
+        tv.bind("<Button-1>", self.on_chat_click)
+        tv.bind("<space>", lambda e: (self.toggle_checks(self.tv.selection()), "break")[1])
         box.grid(row=0 + 1, column=0, sticky="nsew")
         self.tv = tv
         tv.bind("<<TreeviewSelect>>", self.on_pick_chat)
+        self.checked = set()
         tv.bind("<Return>", lambda e: self.b_start.focus_set())
         self.chat_empty = self.empty_state(box)
 
@@ -4190,10 +4334,16 @@ class App:
         self.l_count = ttk.Label(right, text="", style="Muted.TLabel", wraplength=S(330), justify="left")
         self.l_count.grid(row=1, column=0, sticky="w", pady=(S(2), 0))
 
-        self.section(right, "Режим", 2, top=20)
+        self.l_mode_sec = self.section(right, "Режим", 2, top=20)
         self.cb_version = ttk.Combobox(right, textvariable=self.v_version, state="readonly")
         self.cb_version.grid(row=3, column=0, sticky="ew")
         self.combos.append(self.cb_version)
+        self.l_order_sec = self.section(right, "Порядок", 2, top=20)
+        self.seg_order = Segmented(right, self.v_multi_mode, [("sequential", "По очереди"),
+                                                             ("scan_first", "Сначала сканировать все")], k=self.ui.k)
+        self.seg_order.grid(row=3, column=0, sticky="w")
+        self.l_order_sec.grid_remove()
+        self.seg_order.grid_remove()
 
         self.section(right, "Что скачивать", 4)
         tf = ttk.Frame(right)
@@ -4216,6 +4366,14 @@ class App:
             row=7, column=0, sticky="ew")
         self.l_limit.configure(text=f"до {self.v_limit.get()} МБ")
 
+        self.section(right, "После сканирования", 8)
+        Segmented(right, self.v_auto, [(True, "Сразу скачивать"), (False, "Показать сводку")],
+                  k=self.ui.k).grid(row=9, column=0, sticky="w")
+        self.l_order_hint = ttk.Label(right, text="", style="Small.TLabel", wraplength=S(330), justify="left")
+        self.l_order_hint.grid(row=10, column=0, sticky="w", pady=(S(6), 0))
+        self.v_multi_mode.trace_add("write", lambda *a: self.update_chat_header())
+        self.v_auto.trace_add("write", lambda *a: self.update_chat_header())
+
         dest = ttk.Frame(right)
         dest.grid(row=21, column=0, sticky="ew", pady=(S(16), S(8)))
         dest.columnconfigure(0, weight=1)
@@ -4237,6 +4395,31 @@ class App:
     def update_chat_header(self):
         if not hasattr(self, "l_chat_title"):
             return
+        multi = len(getattr(self, "checked", ())) >= 2
+        for w in (self.l_mode_sec, self.cb_version):
+            w.grid_remove() if multi else w.grid()
+        for w in (self.l_order_sec, self.seg_order):
+            w.grid() if multi else w.grid_remove()
+        n = len(getattr(self, "checked", ()))
+        if n:
+            self.b_uncheck.pack(side="right", padx=(0, self.S(12)))
+        else:
+            self.b_uncheck.pack_forget()
+        self.b_start.configure(text=f"Экспортировать выбранные ({n})" if n >= 2 else "Начать экспорт")
+        auto = bool(self.v_auto.get())
+        if multi:
+            names = [self.dialog_map[i][1] for i in self.checked if i in self.dialog_map]
+            self.l_chat_title.configure(text=f"Выбрано чатов: {n}")
+            self.l_count.configure(text=", ".join(sorted(names)[:4]) + (f" и ещё {n - 4}" if n > 4 else ""))
+            if self.v_multi_mode.get() == "scan_first":
+                hint = ("Сначала все чаты сканируются, потом скачиваются файлы. "
+                        + ("Скачивание начнётся сразу." if auto else "Перед скачиванием — одна общая сводка по всем чатам."))
+            else:
+                hint = ("Каждый чат сканируется и сразу скачивается, затем следующий. "
+                        + ("" if auto else "Перед скачиванием каждого чата — сводка; «Нет» пропустит файлы этого чата."))
+            self.l_order_hint.configure(text=hint)
+            return
+        self.l_order_hint.configure(text="" if auto else "Перед скачиванием покажу, сколько файлов и места нужно.")
         chat = self.v_chat.get().strip()
         if not chat:
             self.l_chat_title.configure(text="Чат не выбран")
@@ -4397,9 +4580,16 @@ class App:
         self.l_net_warn.pack(side="left")
         ttk.Button(self.net_warn, text="Настройки подключения", style="Link.TButton",
                    command=lambda: self.show_page("conn")).pack(side="left", padx=(S(8), 0))
-        self.net_warn.grid(row=1, column=0, sticky="w", pady=(S(6), 0))
+        self.net_warn.grid(row=5, column=0, sticky="w", pady=(S(6), 0))
         self.net_warn.grid_remove()
         g.bind("<Configure>", lambda e: self.l_net_warn.configure(wraplength=max(S(240), e.width - S(260))), add="+")
+        self.disk_warn = ttk.Frame(g)
+        self.l_disk_warn = ttk.Label(self.disk_warn, text="", style="Danger.TLabel", justify="left")
+        self.l_disk_warn.pack(side="left")
+        ttk.Button(self.disk_warn, text="Открыть папку", style="Link.TButton",
+                   command=self.open_folder).pack(side="left", padx=(S(8), 0))
+        self.disk_warn.grid(row=1, column=0, sticky="w", pady=(S(6), 0))
+        self.disk_warn.grid_remove()
         self.pb = ttk.Progressbar(g, mode="determinate", maximum=1000)
         self.pb.grid(row=2, column=0, sticky="ew", pady=(S(10), S(10)))
         sf = ttk.Frame(g)
@@ -4543,7 +4733,7 @@ class App:
         cv.create_polygon(*[k for p in poly for k in p], fill=c["accent_soft"], outline="")
         cv.create_line(*[k for p in pts for k in p], fill=c["accent"], width=max(1, S(2)))
 
-    QUIET_PHASES = ("⏸", "Пауза", "Сохраняю", "Создаю", "Собираю", "Проверяю", "Докачиваю", "Кастомные")
+    QUIET_PHASES = ("⏸", "⛔", "Пауза", "Сохраняю", "Создаю", "Собираю", "Проверяю", "Докачиваю", "Кастомные")
     NET_HINT = "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси"
 
     def watchdog(self, now, st, p):
@@ -5171,6 +5361,7 @@ class App:
             all_skip_done=self.v_all_skip.get(),
             theme=self.v_theme.get(),
             col_widths=widths, details_tab=self.v_details_tab.get(), details_h=details_h,
+            multi_mode=self.v_multi_mode.get(),
             graph_period=self.v_graph_period.get(),
         )
         return c
@@ -5263,7 +5454,7 @@ class App:
                                 parent=self.root)
             self.show_page("conn")
             return
-        if not cfg["last_chat"]:
+        if not cfg["last_chat"] and not self.checked:
             messagebox.showinfo("Выберите чат", "Выберите чат в списке или введите его @username, ссылку или ID.",
                                 parent=self.root)
             self.show_page("export")
@@ -5277,6 +5468,20 @@ class App:
             messagebox.showinfo("Папка", "Укажите папку для сохранения на странице «Настройки».", parent=self.root)
             self.show_page("settings")
             return
+        if len(self.checked) >= 2:        # несколько отмеченных чатов
+            chats = [self.dialog_map[i] for i in self.checked if i in self.dialog_map]
+            order = {str(d[0]): n for n, d in enumerate(self.dialogs)}
+            chats.sort(key=lambda d: order.get(str(d[0]), 0))
+            cfg2 = json.loads(json.dumps(cfg))
+            cfg2["all_skip_done"] = False
+            self._begin_job()
+            self.job = self.worker.submit(self.worker.export_all(cfg2, chats))
+            return
+        if len(self.checked) == 1:
+            only = next(iter(self.checked))
+            if only != cfg["last_chat"]:
+                self.start_single(cfg, only, None)
+                return
         self.start_single(cfg, cfg["last_chat"], self.selected_version())
 
     def start_single(self, cfg, chat, version):
@@ -5311,15 +5516,21 @@ class App:
         S = self.S
         kinds = collections.Counter(d[2] for d in self.dialogs)
         d, body, btns = self._modal("Экспорт всех чатов")
-        ttk.Label(body, text="Каждый чат сохранится в отдельную папку. Файлы начнут качаться сразу. "
-                             "Ошибка в одном чате не остановит остальные, а после «Остановить» экспорт "
-                             "продолжится с того же места.", style="Muted.TLabel", wraplength=S(440),
+        ttk.Label(body, text="Каждый чат сохранится в отдельную папку. Ошибка в одном чате не остановит "
+                             "остальные, а после «Остановить» экспорт продолжится с того же места.",
+                  style="Muted.TLabel", wraplength=S(440),
                   justify="left").pack(anchor="w")
         ttk.Label(body, text="Какие чаты", style="Section.TLabel").pack(anchor="w", pady=(S(16), S(4)))
         for k, label in (("Личный", "Личные"), ("Группа", "Группы"), ("Канал", "Каналы")):
             ttk.Checkbutton(body, text=f"{label} · {kinds.get(k, 0)}", variable=self.v_all_kinds[k]).pack(anchor="w")
         ttk.Checkbutton(body, text="Пропускать чаты, которые уже полностью готовы",
                         variable=self.v_all_skip).pack(anchor="w", pady=(S(10), 0))
+        ttk.Label(body, text="Порядок", style="Section.TLabel").pack(anchor="w", pady=(S(16), S(4)))
+        Segmented(body, self.v_multi_mode, [("sequential", "По очереди: скан → скачивание"),
+                                            ("scan_first", "Сначала сканировать все")], k=self.ui.k).pack(anchor="w")
+        ttk.Label(body, text="После сканирования", style="Section.TLabel").pack(anchor="w", pady=(S(16), S(4)))
+        Segmented(body, self.v_auto, [(True, "Сразу скачивать"), (False, "Показать сводку")],
+                  k=self.ui.k).pack(anchor="w")
         summary = ttk.Label(body, text="", style="Value.TLabel")
         summary.pack(anchor="w", pady=(S(16), 0))
         ttk.Label(body, text=f"Папка: {cfg['out_root']}", style="Small.TLabel", wraplength=S(440)).pack(anchor="w")
@@ -5362,6 +5573,38 @@ class App:
             self.set_phase("Останавливаю…")
             self.job.cancel()
 
+    # ---------- галочки в списке чатов ----------
+    def on_chat_click(self, e):
+        if self.tv.identify_region(e.x, e.y) == "tree":      # клик по квадратику — отметить, не выделяя
+            iid = self.tv.identify_row(e.y)
+            if iid:
+                self.toggle_checks([iid])
+            return "break"
+        return None
+
+    def toggle_checks(self, iids):
+        iids = [i for i in iids if i]
+        if not iids:
+            return
+        new = set(self.checked)
+        if all(i in new for i in iids):
+            new.difference_update(iids)
+        else:
+            new.update(iids)
+        self.set_checks(new)
+
+    def toggle_all_checks(self):
+        vis = set(self.tv.get_children())
+        self.set_checks(self.checked - vis if vis and vis <= self.checked else self.checked | vis)
+
+    def set_checks(self, new):
+        self.checked = set(new)
+        for iid in self.tv.get_children():
+            self.tv.item(iid, image=self.ui.tree_cb["on" if iid in self.checked else "off"])
+        vis = set(self.tv.get_children())
+        self.tv.heading("#0", image=self.ui.tree_cb["on" if vis and vis <= self.checked else "off"])
+        self.update_chat_header()
+
     def on_pick_chat(self, _e=None):
         sel = self.tv.selection()
         if sel:
@@ -5400,7 +5643,8 @@ class App:
                 iid = str(did)
                 if tv.exists(iid):
                     continue
-                tv.insert("", "end", iid=iid, values=(name, kind))
+                tv.insert("", "end", iid=iid, values=(name, kind),
+                          image=self.ui.tree_cb["on" if iid in self.checked else "off"])
                 if iid == cur:
                     tv.selection_set(iid)
                     tv.see(iid)
@@ -5832,6 +6076,9 @@ class App:
             self.stat["files"].configure(text=f"{st['ok']} из {st['total_files']}")
             self.stat["failed"].configure(text=str(st["failed"]))
         try:
+            if now - getattr(self, "_disk_t", -1e9) < 5:
+                raise StopIteration
+            self._disk_t = now
             path = self.out_dir or self.v_out.get()
             while path and not os.path.exists(path):
                 parent = os.path.dirname(path)
@@ -5844,9 +6091,18 @@ class App:
             pass
         self.live = live if st["running"] else None
         self.watchdog(now, st, p)
+        low = st.get("disk_low", 0) if st["running"] else 0
+        if low:
+            self.l_disk_warn.configure(text=f"Не хватает места на диске: освободите ещё {human(low)}. "
+                                            "Скачивание на паузе и продолжится само, как только место появится.")
+            self.disk_warn.grid()
+        else:
+            self.disk_warn.grid_remove()
         # пункт меню «Мои экспорты» показывает ход работы с любой страницы
         nav = f"Мои экспорты  ·  {int(self.pb['value']) // 10}%" if st["running"] and stage in ("scan", "download") \
             else ("Мои экспорты  ·  идёт" if st["running"] and stage else "Мои экспорты")
+        if st["running"] and st.get("disk_low"):
+            nav = "Мои экспорты  ·  нет места"
         if self.nav["exports"].cget("text") != nav:
             self.nav["exports"].configure(text=nav)
         self.update_activity()
