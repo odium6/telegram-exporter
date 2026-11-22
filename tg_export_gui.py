@@ -2674,7 +2674,7 @@ class Worker:
                 break
         return best
 
-    async def diagnose(self, variants, chats):
+    async def diagnose(self, variants, chats, reuse_media=False):
         """Проверка вариантов подключения: время подключения, пинг (5 замеров) и скорость скачивания
         настоящего файла (до 8 с). Работает отдельным временным соединением — текущий экспорт не прерывается."""
         import random
@@ -2687,10 +2687,14 @@ class Worker:
                 auth = StringSession.save(self.client.session)
             except Exception:
                 auth = ""
-        media = None
-        if self.client and auth:
+        media = getattr(self, "_diag_media", None) if reuse_media else None
+        if media is None and self.client and auth:
             self.q.put(("diag_note", "Ищу файл для замера скорости…"))
-            media = await self._test_media(chats)
+            try:
+                media = await asyncio.wait_for(self._test_media(chats), 60)
+            except asyncio.TimeoutError:
+                media = None
+            self._diag_media = media      # на шаге «прокси» VPN уже выключен — файл ищем заранее
         self.q.put(("diag_note", "" if media else
                     "Подходящего файла для замера скорости не нашлось — проверяю только подключение и пинг."))
         for label, cfg in variants:
@@ -2786,6 +2790,13 @@ class Worker:
                                       channels=True, files=True,
                                       max_file_size=(int(cfg["size_limit_mb"]) or 4096) * 1024 * 1024)
             self.hist = await stack.enter_async_context(tk_)
+            try:   # проверяем настоящим запросом: режим действительно работает
+                await asyncio.wait_for(self.hist.get_messages("me", limit=1), 30)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                if "takeout" in (cname(e) + str(e)).lower():
+                    raise
             self.q.put(("takeout", {"status": "on", "checked": time.time()}))
             self.log("⚡ Включён режим экспорта Telegram: меньше пауз при чтении истории. "
                      "На других ваших устройствах Telegram может показать уведомление о запросе экспорта — это он.")
@@ -2798,6 +2809,8 @@ class Worker:
                 self.q.put(("takeout", {"status": "delayed", "until": time.time() + secs, "checked": time.time()}))
                 self.log(f"ℹ Режим экспорта Telegram пока недоступен: в целях безопасности Telegram разрешит его "
                          f"с {when:%d.%m.%Y %H:%M} (обычно через сутки после входа на новом устройстве). "
+                         "Чтобы не ждать: в Telegram на телефоне нажмите Allow (Разрешить) в сообщении "
+                         "«Data export request». "
                          "Экспорт идёт в обычном режиме — Telegram будет делать короткие паузы каждые ~3000 сообщений.")
             else:
                 self.q.put(("takeout", {"status": "failed", "error": str(e)[:200], "checked": time.time()}))
@@ -3119,7 +3132,7 @@ class Worker:
             raise ValueError("Сначала подключитесь к Telegram (страница «Подключение»).")
         client = self.client
         hist = getattr(self, "hist", None) or client   # история — через режим экспорта Telegram, если он открыт
-        self.stats.update(ok=0, failed=0, total_files=0, running=True)
+        self.stats.update(ok=0, failed=0, total_files=0, running=True, bytes_before=0)
         self.progress.reset(0)
 
         target = int(chat) if str(chat).lstrip("-").isdigit() else chat
@@ -3480,6 +3493,8 @@ class Worker:
         self.stats.update(ok=len(wanted) - len(todo), failed=0, total_files=len(wanted),
                           stage="download", msg_n=total_msgs, msg_total=total_msgs)
         self.progress.reset(todo_bytes, partial_bytes)
+        # уже скачанное в прошлые запуски — чтобы прогресс после обрыва считался по всему чату, а не с 0%
+        self.stats["bytes_before"] = max(0, sum(v[1] for v in wanted.values()) - todo_bytes)
         sess = getattr(self, "session", None) or {"started": time.time(), "restarts": 0, "bytes": 0,
                                                     "dl_seconds": 0.0, "failed": {}}
         self.session = sess
@@ -4091,7 +4106,7 @@ EN.update({
     "Язык изменится после перезапуска программы.": "The language will change after the program restarts.",
     "Чтобы сменить язык, программу нужно перезапустить. Перезапустить сейчас?": "The program must restart to change the language. Restart now?",
     "Проверьте настройки": "Check the settings",
-    "Укажите папку для сохранения на странице «Настройки».": "Choose the save folder on the «Settings» page.",
+    "Выберите папку, куда сохранять экспорт.": "Choose the folder to save the export to.",
     "Выберите чат": "Choose a chat",
     "Выберите чат в списке или введите его @username, ссылку или ID.": "Choose a chat in the list or enter its @username, link or ID.",
     "Без файлов": "No files", "Не выбран ни один тип файлов. Экспортировать только текст?": "No file types selected. Export text only?",
@@ -4125,6 +4140,26 @@ EN.update({
     "Вырезать": "Cut", "Вставить": "Paste", "Выделить всё": "Select all",
     "Telegram больше не отдаёт этот файл (самоуничтожающееся фото/видео или файл удалён)":
         "Telegram no longer provides this file (self-destructing photo/video or deleted file)",
+    "Здесь — настройки самой программы. Всё, что касается экспорта (папка, форматы, скорость скачивания), — на странице «Экспорт».":
+        "Settings of the program itself. Everything about exporting (folder, formats, download speed) is on the Export page.",
+    "Дополнительно: форматы, скорость, повторы…": "More: formats, speed, retries…",
+    "Скрыть дополнительные настройки": "Hide extra settings",
+    "Форматы": "Formats", "Скорость и надёжность": "Speed and reliability",
+    "Файлов одновременно (3–6)": "Files at once (3–6)", "Потоков на файл больше 2 МБ": "Threads per file over 2 MB",
+    "Зависший — файл, по которому за это время не пришло ни одного байта. После всех повторов файл пропускается и попадает в отчёт; его можно докачать позже.":
+        "Stalled means not a single byte arrived during this time. After all retries the file is skipped and listed in the report; it can be downloaded later.",
+    "Проверка связи — шаг 1 из 2": "Connection test — step 1 of 2",
+    "Проверка связи — шаг 2 из 2": "Connection test — step 2 of 2",
+    "Шаг 1: VPN.\n\nВключите VPN (если пользуетесь им) и нажмите «ОК» — проверю подключение без прокси.\n\nПотом попрошу выключить VPN и проверю прокси: VPN и прокси одновременно мешают друг другу, поэтому замеры идут по очереди.":
+        "Step 1: VPN.\n\nTurn on your VPN (if you use one) and press OK — I will test the connection without a proxy.\n\nThen I will ask you to turn the VPN off and test the proxy: VPN and proxy interfere with each other, so they are measured one after another.",
+    "Проверка идёт по шагам: сначала с включённым VPN, потом программа попросит выключить VPN и проверит прокси. Покажу пинг и скорость скачивания и подскажу, где быстрее.":
+        "The test runs in steps: first with the VPN on, then the program asks you to turn the VPN off and tests the proxy. It shows ping and download speed and suggests the fastest option.",
+    "VPN / без прокси": "VPN / no proxy",
+    "Чтобы не ждать: в Telegram на телефоне откройте сообщение «Data export request» от Telegram, нажмите Allow (Разрешить), затем «Проверить сейчас».":
+        "No need to wait: on your phone open the “Data export request” message from Telegram, press Allow, then “Check now”.",
+    "Когда программа впервые просит этот режим, Telegram присылает в чат «Telegram» сообщение «Data export request» — это запрос этой программы. Нажмите в нём Allow (Разрешить) на телефоне — режим разрешится сразу (сообщение станет «Accepted»). Если не нажимать, Telegram разрешит его сам примерно через сутки.":
+        "When the program first asks for this mode, Telegram sends a “Data export request” message to the “Telegram” chat — that is this program's request. Press Allow in it on your phone and the mode is allowed right away (the message becomes “Accepted”). Otherwise Telegram allows it by itself in about a day.",
+    "сейчас": "now",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -5236,10 +5271,13 @@ class App:
 
         self.vline(body).grid(row=0, column=1, sticky="ns", padx=S(24))
 
-        right = ttk.Frame(body)
-        right.grid(row=0, column=2, sticky="nsew")
+        right_outer = ttk.Frame(body)
+        right_outer.grid(row=0, column=2, sticky="nsew")
+        right_outer.columnconfigure(0, weight=1)
+        right_outer.rowconfigure(0, weight=1)
+        sc_area, right = self.scroll_area(right_outer, S(340))
+        sc_area.grid(row=0, column=0, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(20, weight=1)
         self.l_chat_title = ttk.Label(right, text="", style="H2.TLabel", wraplength=S(330), justify="left")
         self.l_chat_title.grid(row=0, column=0, sticky="w")
         self.l_count = ttk.Label(right, text="", style="Muted.TLabel", wraplength=S(330), justify="left")
@@ -5291,15 +5329,97 @@ class App:
         self.v_multi_mode.trace_add("write", lambda *a: self.update_chat_header())
         self.v_auto.trace_add("write", lambda *a: self.update_chat_header())
 
-        dest = ttk.Frame(right)
+        # дополнительные настройки экспорта (раньше были на странице «Настройки»); папка — внизу, «Изменить»
+        self.b_more = ttk.Button(right, text="", style="Link.TButton", command=self.toggle_more)
+        self.b_more.grid(row=11, column=0, sticky="w", pady=(S(8), 0))
+        more = ttk.Frame(right)
+        more.grid(row=12, column=0, sticky="ew", pady=(S(6), 0))
+        more.columnconfigure(0, weight=1)
+        self.more_frame = more
+        ttk.Label(more, text="Форматы", style="Section.TLabel").grid(row=2, column=0, columnspan=2, sticky="w",
+                                                                     pady=(0, S(2)))
+        ttk.Checkbutton(more, text="HTML — для просмотра в браузере", variable=self.v_html).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(more, text="JSON — формат Telegram Desktop", variable=self.v_json).grid(
+            row=4, column=0, columnspan=2, sticky="w")
+        ttk.Label(more, text="Скорость и надёжность", style="Section.TLabel").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(S(14), S(2)))
+        for i, (label, var, lo, hi) in enumerate((
+                ("Файлов одновременно (3–6)", self.v_parallel, 1, 16),
+                ("Потоков на файл больше 2 МБ", self.v_threads, 1, 8),
+                ("Зависшим считать через, с", self.v_stall, 30, 1800),
+                ("Повторов перед пропуском", self.v_retries, 0, 10))):
+            ttk.Label(more, text=label, style="Muted.TLabel").grid(row=6 + i, column=0, sticky="w")
+            ttk.Spinbox(more, from_=lo, to=hi, textvariable=var, width=6).grid(row=6 + i, column=1, sticky="e",
+                                                                                pady=S(3))
+        ttk.Label(more, text="Зависший — файл, по которому за это время не пришло ни одного байта. После всех "
+                             "повторов файл пропускается и попадает в отчёт; его можно докачать позже.",
+                  style="Small.TLabel", wraplength=S(320), justify="left").grid(row=10, column=0, columnspan=2,
+                                                                                 sticky="w", pady=(S(6), S(4)))
+        self.toggle_more(init=True)
+
+        dest = ttk.Frame(right_outer)
         dest.grid(row=21, column=0, sticky="ew", pady=(S(16), S(8)))
         dest.columnconfigure(0, weight=1)
         self.l_dest = ttk.Label(dest, text="", style="Small.TLabel")
         self.l_dest.grid(row=0, column=0, sticky="w")
         ttk.Button(dest, text="Изменить", style="Link.TButton", command=self.pick_folder).grid(
             row=0, column=1, sticky="e")
-        self.b_start = ttk.Button(right, text="Начать экспорт", style="Accent.TButton", command=self.on_start)
+        self.b_start = ttk.Button(right_outer, text="Начать экспорт", style="Accent.TButton", command=self.on_start)
         self.b_start.grid(row=22, column=0, sticky="ew", ipady=S(3))
+
+    def open_more(self):
+        """Показать «Дополнительно» на странице «Экспорт» (форматы, скорость, повторы)."""
+        self.show_page("export")
+        if not self.cfg.get("export_more", False):
+            self.toggle_more()
+
+    def toggle_more(self, init=False):
+        if not init:
+            self.cfg["export_more"] = not self.cfg.get("export_more", False)
+            self.save_cfg()
+        opened = bool(self.cfg.get("export_more", False))
+        self.b_more.configure(text="Скрыть дополнительные настройки" if opened else
+                              "Дополнительно: форматы, скорость, повторы…")
+        if opened:
+            self.more_frame.grid()
+        else:
+            self.more_frame.grid_remove()
+
+    def scroll_area(self, parent, width):
+        """Прокручиваемая область: полоса прокрутки появляется, только если содержимое не помещается."""
+        holder = ttk.Frame(parent)
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+        cv = tk.Canvas(holder, highlightthickness=0, bd=0, width=width, height=self.S(240))
+        self.theme_tk(cv, lambda c, w=cv: w.configure(bg=c["bg"]))
+        cv.grid(row=0, column=0, sticky="nsew")
+        inner = ttk.Frame(cv)
+        win = cv.create_window(0, 0, window=inner, anchor="nw")
+        sb = ttk.Scrollbar(holder, orient="vertical", command=cv.yview)
+
+        def sync(_e=None):
+            cv.configure(scrollregion=(0, 0, inner.winfo_reqwidth(), inner.winfo_reqheight()))
+            need = inner.winfo_reqheight() > cv.winfo_height() + 1
+            if need and not sb.winfo_ismapped():
+                sb.grid(row=0, column=1, sticky="ns", padx=(self.S(6), 0))
+            elif not need and sb.winfo_ismapped():
+                sb.grid_remove()
+                cv.yview_moveto(0)
+        inner.bind("<Configure>", sync, add="+")
+        cv.bind("<Configure>", lambda e: (cv.itemconfigure(win, width=e.width), sync()), add="+")
+        cv.configure(yscrollcommand=sb.set)
+
+        def wheel(e):
+            w = e.widget
+            if not isinstance(w, tk.Misc) or not str(w).startswith(str(cv)):
+                return None
+            if isinstance(w, ttk.Combobox) or not sb.winfo_ismapped():
+                return None
+            cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+            return None
+        self.root.bind_all("<MouseWheel>", wheel, add="+")
+        return holder, inner
 
     def update_limit_state(self):
         st = "disabled" if self.v_unlimited.get() else "normal"
@@ -5328,6 +5448,9 @@ class App:
             links.append(l)
         self.tko_notice = f
         f.grid_remove()
+
+    TKO_ALLOW = ("Чтобы не ждать: в Telegram на телефоне откройте сообщение «Data export request» от Telegram, "
+                 "нажмите Allow (Разрешить), затем «Проверить сейчас».")
 
     def takeout_state(self):
         st = dict(self.cfg.get("takeout") or {})
@@ -5362,7 +5485,8 @@ class App:
         else:
             self.tko_notice.grid_remove()
         if hasattr(self, "l_tko_status"):
-            self.l_tko_status.configure(text=self.takeout_text())
+            self.l_tko_status.configure(text=self.takeout_text() + (
+                "\n" + self.TKO_ALLOW if st.get("status") == "delayed" else ""))
             ready = self.worker.client is not None and not self.busy
             self.b_tko_check.configure(state="normal" if ready else "disabled")
 
@@ -5401,9 +5525,10 @@ class App:
         for text in (
                 "Это тот же режим, которым пользуется Telegram Desktop при «Экспорте данных». В нём Telegram мягче "
                 "ограничивает частоту запросов, поэтому при чтении истории (сканировании) меньше пауз.",
-                "Когда программа впервые просит этот режим, Telegram в целях безопасности откладывает его примерно на "
-                "сутки после входа на новом устройстве и присылает на ваши другие устройства уведомление о запросе "
-                "экспорта. Это запрос этой программы — подтверждение в Telegram и есть то самое разрешение.",
+                "Когда программа впервые просит этот режим, Telegram присылает в чат «Telegram» сообщение "
+                "«Data export request» — это запрос этой программы. Нажмите в нём Allow (Разрешить) на телефоне — "
+                "режим разрешится сразу (сообщение станет «Accepted»). Если не нажимать, Telegram разрешит его сам "
+                "примерно через сутки.",
                 "Программа сама включает режим при каждом запуске экспорта. Пока Telegram его не разрешил, экспорт "
                 "идёт в обычном режиме — ничего делать не нужно.",
                 "На скорость скачивания файлов режим не влияет — только на паузы при сканировании истории."):
@@ -5667,6 +5792,11 @@ class App:
         self.theme_tk(self.graph, lambda c, w=self.graph: w.configure(bg=c["bg"]))
         self.graph.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(S(10), 0))
         self.graph.bind("<Configure>", lambda e: self.draw_graph())
+        self.graph.bind("<Motion>", self.graph_hover)
+        self.graph.bind("<Leave>", self.graph_hover)
+        self._graph_pts = []
+        self._ghover_x = None
+        self._graph_unit = str
 
         lg = ttk.Frame(stack)
         lg.grid(row=0, column=0, sticky="nsew")
@@ -5764,20 +5894,58 @@ class App:
                                                                             else "−30 мин"), (1.0, "сейчас")):
             cv.create_text(pad_l + gw * frac, pad_t + gh + S(4), text=txt, anchor="n" if 0 < frac < 1 else
                            ("nw" if frac == 0 else "ne"), fill=c["muted"], font=fnt)
+        self._graph_pts = []
+        self._graph_box = (pad_l, pad_t, gw, gh)
         if len(data) < 2:
             return
         buckets = {}                  # не больше одной точки на пиксель ширины
         for t, v in data:
             x = int(gw * (1 - (now - t) / period))
-            buckets.setdefault(x, []).append(v)
+            buckets.setdefault(x, []).append((t, v))
         pts = []
         for x in sorted(buckets):
-            v = sum(buckets[x]) / len(buckets[x])
+            v = sum(b[1] for b in buckets[x]) / len(buckets[x])
+            t = sum(b[0] for b in buckets[x]) / len(buckets[x])
             pts.append((pad_l + x, pad_t + gh * (1 - min(v, vmax) / vmax)))
+            self._graph_pts.append((pad_l + x, pts[-1][1], v, t))
         base = pad_t + gh
         poly = [(pts[0][0], base)] + pts + [(pts[-1][0], base)]
         cv.create_polygon(*[k for p in poly for k in p], fill=c["accent_soft"], outline="")
         cv.create_line(*[k for p in pts for k in p], fill=c["accent"], width=max(1, S(2)))
+        self._graph_unit = unit
+        self.draw_graph_hover()
+
+    def graph_hover(self, e):
+        """Наведение курсора на график — скорость в этой точке и когда это было."""
+        self._ghover_x = None if str(e.type) in ("Leave", "8") else e.x
+        self.draw_graph_hover()
+
+    def draw_graph_hover(self):
+        cv, c, S = self.graph, self.ui.c, self.S
+        cv.delete("hover")
+        x = self._ghover_x
+        pts = self._graph_pts
+        if x is None or not pts:
+            return
+        px, py, v, t = min(pts, key=lambda p: abs(p[0] - x))
+        if abs(px - x) > S(40):
+            return
+        pad_l, pad_t, gw, gh = self._graph_box
+        cv.create_line(px, pad_t, px, pad_t + gh, fill=c["muted"], dash=(3, 3), tags="hover")
+        r = max(3, S(4))
+        cv.create_oval(px - r, py - r, px + r, py + r, fill=c["accent"], outline=c["bg"], width=max(1, S(2)),
+                       tags="hover")
+        ago = max(0, time.monotonic() - t)
+        when = "сейчас" if ago < 5 else (f"{int(ago)} с назад" if ago < 60 else
+                                         f"{int(ago // 60)} мин {int(ago % 60):02d} с назад")
+        text = f"{self._graph_unit(v)} · {when}"
+        fnt = self.ui.f_small
+        tw = fnt.measure(text) + S(16)
+        th = fnt.metrics("linespace") + S(8)
+        bx = px + S(10) if px + S(10) + tw <= pad_l + gw else px - S(10) - tw
+        by = max(pad_t, min(py - th - S(8), pad_t + gh - th))
+        cv.create_rectangle(bx, by, bx + tw, by + th, fill=c["field"], outline=c["border_strong"], tags="hover")
+        cv.create_text(bx + S(8), by + th / 2, text=text, anchor="w", fill=c["text"], font=fnt, tags="hover")
 
     QUIET_PHASES = ("⏸", "⛔", "Пауза", "Сохраняю", "Создаю", "Собираю", "Проверяю", "Докачиваю", "Кастомные")
     NET_HINT = "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси"
@@ -5958,6 +6126,7 @@ class App:
             if r["code"] == "running":
                 self.ex_running_iid = iid
                 self.ex_running_want = r["want_bytes"]
+                self.ex_running_failed = r["failed"]
             if (r["dir"] or r["name"]) in sel:
                 tv.selection_add(iid)
         if self._select_running and self.ex_running_iid:
@@ -6009,8 +6178,9 @@ class App:
             self.show_page("conn")
             return False
         if not cfg["out_root"]:
-            messagebox.showinfo("Папка", "Укажите папку для сохранения на странице «Настройки».", parent=self.root)
-            self.show_page("settings")
+            messagebox.showinfo("Папка", "Выберите папку, куда сохранять экспорт.", parent=self.root)
+            self.show_page("export")
+            self.pick_folder()
             return False
         return True
 
@@ -6158,8 +6328,9 @@ class App:
             self.proxy_rows[key] = self.field_row(pcol, 3 + i, label, var, width=width, show=show)
 
         self.section(pcol, "Проверка связи", 9, top=24, colspan=2)
-        ttk.Label(pcol, text="Сравните варианты: проверьте с включённым VPN, потом выключите VPN, запустите прокси "
-                             "и проверьте снова. Покажу пинг и скорость скачивания и подскажу, где быстрее.",
+        ttk.Label(pcol, text="Проверка идёт по шагам: сначала с включённым VPN, потом программа попросит "
+                             "выключить VPN и проверит прокси. Покажу пинг и скорость скачивания и подскажу, "
+                             "где быстрее.",
                   style="Muted.TLabel", wraplength=S(460), justify="left").grid(row=10, column=0, columnspan=2,
                                                                                   sticky="w")
         db = ttk.Frame(pcol)
@@ -6204,7 +6375,7 @@ class App:
 
     def diag_variants(self, cfg):
         """Что проверять: без прокси (напрямую или через VPN) и настроенные прокси."""
-        out = [("Без прокси / VPN", "", dict(cfg, proxy_type=""))]
+        out = [("VPN / без прокси", "", dict(cfg, proxy_type=""))]
         if cfg.get("proxy_link") or cfg.get("proxy_secret"):
             out.append((f"MTProto {cfg.get('proxy_host')}:{cfg.get('proxy_port')}", "mtproto",
                         dict(cfg, proxy_type="mtproto")))
@@ -6225,10 +6396,24 @@ class App:
             return
         variants = self.diag_variants(cfg)
         self.diag_kind = {label: kind for label, kind, _ in variants}
+        direct = [v for v in variants if v[1] == ""]
+        proxies = [v for v in variants if v[1] != ""]
+        self._diag_chats = [c for c in [self.v_chat.get().strip()] if c] + [str(d[0]) for d in self.dialogs[:8]]
+        self._diag_next = proxies
+        if proxies:
+            if not messagebox.askokcancel(
+                    "Проверка связи — шаг 1 из 2",
+                    "Шаг 1: VPN.\n\nВключите VPN (если пользуетесь им) и нажмите «ОК» — проверю подключение "
+                    "без прокси.\n\nПотом попрошу выключить VPN и проверю прокси: VPN и прокси одновременно "
+                    "мешают друг другу, поэтому замеры идут по очереди.", parent=self.root):
+                return
+        self.run_diag(direct)
+
+    def run_diag(self, variants, reuse_media=False):
         self.b_diag.configure(state="disabled")
         self.l_diag_note.configure(text="Проверяю… это займёт до полуминуты на вариант.")
-        chats = [c for c in [self.v_chat.get().strip()] if c] + [str(d[0]) for d in self.dialogs[:8]]
-        coro = self.worker.diagnose([(label, c) for label, _, c in variants], chats)
+        coro = self.worker.diagnose([(label, c) for label, _, c in variants], self._diag_chats,
+                                    reuse_media=reuse_media)
 
         async def safe():
             try:
@@ -6244,6 +6429,15 @@ class App:
             self.l_diag_note.configure(text=item[1])
             return
         if kind == "diag_done":
+            nxt, self._diag_next = getattr(self, "_diag_next", None), None
+            if nxt and not self.l_diag_note.cget("text").startswith("Проверка не"):
+                names = ", ".join(label for label, _, _ in nxt)
+                if messagebox.askokcancel(
+                        "Проверка связи — шаг 2 из 2",
+                        f"Шаг 2: прокси ({names}).\n\nТеперь ВЫКЛЮЧИТЕ VPN и запустите прокси "
+                        "(например, tg-ws-proxy), затем нажмите «ОК».", parent=self.root):
+                    self.run_diag(nxt, reuse_media=True)
+                    return
             self.b_diag.configure(state="normal")
             if not self.l_diag_note.cget("text").startswith("Проверка не"):
                 self.l_diag_note.configure(text="Готово. Можно переключить VPN/прокси и проверить ещё раз.")
@@ -6362,29 +6556,9 @@ class App:
         col = ttk.Frame(body)
         col.grid(row=0, column=0, sticky="nw")
 
-        self.section(col, "Сохранение", 0, top=0, colspan=3)
-        ttk.Label(col, text="Папка экспорта", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, S(16)))
-        pf = ttk.Frame(col)
-        pf.grid(row=1, column=1, columnspan=2, sticky="w", pady=S(4))
-        ttk.Entry(pf, textvariable=self.v_out, width=52).pack(side="left")
-        ttk.Button(pf, text="Обзор…", command=self.pick_folder).pack(side="left", padx=(S(8), 0))
-        ttk.Label(col, text="Форматы", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, S(16)))
-        ff = ttk.Frame(col)
-        ff.grid(row=2, column=1, columnspan=2, sticky="w", pady=S(4))
-        ttk.Checkbutton(ff, text="HTML — для просмотра в браузере", variable=self.v_html).pack(side="left")
-        ttk.Checkbutton(ff, text="JSON — формат Telegram Desktop", variable=self.v_json).pack(
-            side="left", padx=(S(20), 0))
-
-        self.section(col, "Скорость и надёжность", 4, top=28, colspan=3)
-        for i, (label, var, lo, hi, tip) in enumerate((
-                ("Файлов одновременно", self.v_parallel, 1, 16, "оптимально 3–6"),
-                ("Потоков на большой файл", self.v_threads, 1, 8, "для файлов больше 2 МБ"),
-                ("Зависшим считать через, с", self.v_stall, 30, 1800, "если не пришло ни одного байта"),
-                ("Повторов перед пропуском", self.v_retries, 0, 10, "потом файл пропускается и попадает в отчёт"))):
-            ttk.Label(col, text=label, style="Muted.TLabel").grid(row=5 + i, column=0, sticky="w", padx=(0, S(16)))
-            ttk.Spinbox(col, from_=lo, to=hi, textvariable=var, width=7).grid(row=5 + i, column=1, sticky="w",
-                                                                               pady=S(4))
-            ttk.Label(col, text=tip, style="Small.TLabel").grid(row=5 + i, column=2, sticky="w", padx=(S(12), 0))
+        ttk.Label(col, text="Здесь — настройки самой программы. Всё, что касается экспорта (папка, форматы, "
+                            "скорость скачивания), — на странице «Экспорт».", style="Muted.TLabel",
+                  wraplength=S(560), justify="left").grid(row=0, column=0, columnspan=3, sticky="w")
 
         self.section(col, "Язык", 11, top=28, colspan=3)
         ttk.Label(col, text="Язык программы", style="Muted.TLabel").grid(row=12, column=0, sticky="w",
@@ -6392,7 +6566,7 @@ class App:
         Segmented(col, self.v_language, [("system", "Как в системе"), ("ru", "Русский"), ("en", "English")],
                   command=self.on_language, k=self.ui.k).grid(row=12, column=1, columnspan=2, sticky="w", pady=S(4))
 
-        self.section(col, "Оформление", 9, top=28, colspan=3)
+        self.section(col, "Оформление", 9, top=24, colspan=3)
         ttk.Label(col, text="Тема", style="Muted.TLabel").grid(row=10, column=0, sticky="w", padx=(0, S(16)))
         Segmented(col, self.v_theme, [("light", "Светлая"), ("dark", "Тёмная"), ("system", "Как в системе")],
                   command=self.on_theme, k=self.ui.k).grid(row=10, column=1, columnspan=2, sticky="w", pady=S(4))
@@ -6675,7 +6849,10 @@ class App:
             except (tk.TclError, ValueError):
                 messagebox.showwarning("Проверьте настройки", f"В поле «{name}» должно быть целое число.",
                                        parent=self.root)
-                self.show_page("settings")
+                if var is self.v_limit:
+                    self.show_page("export")
+                else:
+                    self.open_more()
                 return True
         return False
 
@@ -6765,8 +6942,9 @@ class App:
                                        parent=self.root):
                 return
         if not cfg["out_root"]:
-            messagebox.showinfo("Папка", "Укажите папку для сохранения на странице «Настройки».", parent=self.root)
-            self.show_page("settings")
+            messagebox.showinfo("Папка", "Выберите папку, куда сохранять экспорт.", parent=self.root)
+            self.show_page("export")
+            self.pick_folder()
             return
         if len(self.checked) >= 2:        # несколько отмеченных чатов
             chats = [self.dialog_map[i] for i in self.checked if i in self.dialog_map]
@@ -6812,8 +6990,9 @@ class App:
             self.show_page("conn")
             return
         if not cfg["out_root"]:
-            messagebox.showinfo("Папка", "Укажите папку для сохранения на странице «Настройки».", parent=self.root)
-            self.show_page("settings")
+            messagebox.showinfo("Папка", "Выберите папку, куда сохранять экспорт.", parent=self.root)
+            self.show_page("export")
+            self.pick_folder()
             return
         S = self.S
         kinds = collections.Counter(d[2] for d in self.dialogs)
@@ -7477,15 +7656,15 @@ class App:
             self.graph_mode = "download"
             if avg <= 0:
                 avg = rate(600)    # долгая пауза — берём среднюю за 10 минут, а не «—»
-            pct = min(1.0, p.n / p.total) if p.total else 0
+            before = st.get("bytes_before", 0) or 0          # скачано в прошлые запуски
+            n_all, t_all = before + p.n, before + p.total     # прогресс — по всему чату, а не по остатку
+            pct = min(1.0, n_all / t_all) if t_all else 0
             self.pb["value"] = pct * 1000
-            self.stat["bytes"].configure(text=f"{human(p.n)} / {human(p.total)} ({pct * 100:.0f}%)")
+            self.stat["bytes"].configure(text=f"{human(n_all)} / {human(t_all)} ({pct * 100:.0f}%)")
             self.stat["speed"].configure(text=f"{human(cur)}/с · ср. {human(avg)}/с" if avg else "пауза…")
             live.update(status="Идёт: скачивание", pct=f"{pct * 100:.0f}%",
-                        speed=f"{human(cur)}/с" if cur else "пауза")
-            want = getattr(self, "ex_running_want", 0) or 0
-            if want >= p.total:                       # всего по чату = уже скачанное раньше + в этом запуске
-                live["size"] = f"{human(want - p.total + p.n)} из {human(want)}"
+                        speed=f"{human(cur)}/с" if cur else "пауза",
+                        size=f"{human(n_all)} из {human(t_all)}")
             if avg > 0 and p.total > p.n:
                 left = (p.total - p.n) / avg
                 self.dl_eta = left
@@ -7517,6 +7696,9 @@ class App:
         if st["total_files"]:
             self.stat["files"].configure(text=f"{st['ok']} из {st['total_files']}")
             self.stat["failed"].configure(text=str(st["failed"]))
+            if st["running"] and stage in ("download", "finish"):
+                fl = max(st["failed"], getattr(self, "ex_running_failed", 0) or 0)
+                live["files"] = f"{st['ok']} / {st['total_files']}" + (f" ⚠{fl}" if fl else "")
         try:
             if now - getattr(self, "_disk_t", -1e9) < 5:
                 raise StopIteration
