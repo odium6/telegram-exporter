@@ -2754,6 +2754,7 @@ class Worker:
         if not cfg.get("use_takeout", True):
             return
         self.phase("Открываю режим экспорта Telegram...")
+        await self._close_stale_takeout()
         try:
             tk_ = self.client.takeout(finalize=True, users=True, chats=True, megagroups=True,
                                       channels=True, files=True,
@@ -2775,6 +2776,25 @@ class Worker:
             else:
                 self.q.put(("takeout", {"status": "failed", "error": str(e)[:200], "checked": time.time()}))
                 self.log(f"ℹ Режим экспорта Telegram не включился ({e}). Экспорт идёт в обычном режиме.")
+
+    async def _close_stale_takeout(self):
+        """Если прошлый сеанс режима экспорта не был закрыт (программу закрыли посреди экспорта
+        или в момент закрытия пропала связь), его номер остаётся в файле входа, и Telegram/Telethon
+        отказываются открывать новый. Закрываем старый; если не вышло — просто забываем его."""
+        sess = getattr(self.client, "session", None)
+        if sess is None or getattr(sess, "takeout_id", None) is None:
+            return
+        try:
+            await asyncio.wait_for(self.client.end_takeout(success=False), 30)
+        except Exception:
+            pass
+        if getattr(sess, "takeout_id", None) is not None:
+            try:
+                sess.takeout_id = None
+                sess.save()
+            except Exception:
+                pass
+        self.log("ℹ Закрыт незавершённый прошлый сеанс режима экспорта Telegram.")
 
     async def check_takeout(self, cfg):
         """«Проверить сейчас»: открыть режим экспорта и сразу закрыть — узнать, разрешил ли его Telegram."""
@@ -4063,6 +4083,7 @@ EN.update({
     "Списoк всех чатов со ссылками: index.html. Журнал: _all_chats.log": "List of all chats with links: index.html. Log: _all_chats.log",
     "Список всех чатов со ссылками: index.html. Журнал: _all_chats.log": "List of all chats with links: index.html. Log: _all_chats.log",
     # статусы и журнал
+    "ℹ Закрыт незавершённый прошлый сеанс режима экспорта Telegram.": "ℹ Closed an unfinished previous Telegram export mode session.",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
