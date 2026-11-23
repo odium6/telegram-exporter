@@ -2323,7 +2323,7 @@ class Worker:
         """Telethon не может связаться с Telegram — говорим об этом понятно, а не молча ждём."""
         now = time.monotonic()
         self.net_issue_at = now
-        self.phase("📡 Нет связи с Telegram — проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси. Программа продолжит сама, когда связь появится.")
+        self.phase("📡 Нет связи с Telegram — проверьте, что включён VPN или запущен прокси, и что на странице «Подключение» выбран нужный вид прокси. Программа продолжит сама, когда связь появится.")
         if now - getattr(self, "_net_last_log", -1e9) > 60:
             self._net_last_log = now
             self.log("📡 Не удаётся связаться с Telegram (" + str(detail)[:120] + "). Похоже, нет интернета, "
@@ -4037,7 +4037,7 @@ EN.update({
     # подключение
     "Подключиться": "Connect", "Переподключиться": "Reconnect", "Выйти из аккаунта": "Log out",
     "Показать hash": "Show hash", "Скрыть hash": "Hide hash", "Где взять API ID и hash →": "Where to get API ID and hash →",
-    "Прокси": "Proxy", "Без прокси": "No proxy", "MTProto (tg-ws-proxy)": "MTProto (tg-ws-proxy)",
+    "Прокси": "Proxy", "Без прокси": "No proxy", "MTProto": "MTProto",
     "Ссылка": "Link", "Сервер": "Server", "Порт": "Port", "Секрет": "Secret", "Логин": "Login", "Пароль": "Password",
     "Проверка связи": "Connection test",
     "Сравните варианты: проверьте с включённым VPN, потом выключите VPN, запустите прокси и проверьте снова. Покажу пинг и скорость скачивания и подскажу, где быстрее.":
@@ -4068,6 +4068,12 @@ EN.update({
         "Direct connection. Use it if a VPN is on for the whole computer.",
     "Вставьте ссылку из tg-ws-proxy (значок в трее → «Скопировать ссылку») или заполните сервер, порт и секрет вручную.":
         "Paste the link from tg-ws-proxy (tray icon → «Copy link») or fill in server, port and secret manually.",
+    "Вставьте ссылку на прокси (tg://proxy?… или https://t.me/proxy?…) или заполните сервер, порт и секрет вручную. Подойдёт любой MTProto-прокси, в том числе локальный tg-ws-proxy.":
+        "Paste a proxy link (tg://proxy?… or https://t.me/proxy?…) or fill in server, port and secret manually. Any MTProto proxy works, including a local tg-ws-proxy.",
+    "«Проверить подключение» — пинг и скорость выбранного сейчас способа. «Диагностика» сравнит способы по шагам: сначала с включённым VPN, потом попросит выключить VPN и проверит прокси, и подскажет, где быстрее.":
+        "“Check connection” measures ping and speed of the currently selected method. “Diagnostics” compares methods step by step: first with the VPN on, then asks you to turn the VPN off and tests the proxy, and suggests the fastest.",
+    "Диагностика…": "Diagnostics…",
+    "Диагностика — шаг 1 из 2": "Diagnostics — step 1 of 2", "Диагностика — шаг 2 из 2": "Diagnostics — step 2 of 2",
     "Локальный SOCKS5-порт VPN-клиента или обычный SOCKS5-прокси.": "A VPN client's local SOCKS5 port or a regular SOCKS5 proxy.",
     "Нажмите «Подключиться», чтобы войти в Telegram.": "Press «Connect» to log in to Telegram.",
     "Укажите API ID и API hash и нажмите «Подключиться».": "Enter API ID and API hash and press «Connect».",
@@ -4160,6 +4166,14 @@ EN.update({
     "Когда программа впервые просит этот режим, Telegram присылает в чат «Telegram» сообщение «Data export request» — это запрос этой программы. Нажмите в нём Allow (Разрешить) на телефоне — режим разрешится сразу (сообщение станет «Accepted»). Если не нажимать, Telegram разрешит его сам примерно через сутки.":
         "When the program first asks for this mode, Telegram sends a “Data export request” message to the “Telegram” chat — that is this program's request. Press Allow in it on your phone and the mode is allowed right away (the message becomes “Accepted”). Otherwise Telegram allows it by itself in about a day.",
     "сейчас": "now",
+    "Версии сканирования": "Scan versions", "Версии сканирования…": "Scan versions…",
+    "Снимок истории сохраняется после каждого завершённого сканирования. Из любой версии можно собрать экспорт — в нём будут и сообщения, которые потом удалили. HTML и JSON в папке чата будут пересобраны по выбранной версии; уже скачанные файлы не качаются заново (файлы удалённых сообщений Telegram может уже не отдать).":
+        "A snapshot of the history is saved after every completed scan. You can build an export from any version — it includes messages deleted later. HTML and JSON in the chat folder are rebuilt from the chosen version; files already downloaded are not downloaded again (Telegram may no longer provide files of deleted messages).",
+    "Сканирование": "Scan", "Файлов": "Files", "Занимает": "Size on disk",
+    "Версий пока нет — первая появится после завершённого сканирования.": "No versions yet — the first one appears after a completed scan.",
+    "Экспорт из версии": "Export from version", "Экспорт из этой версии": "Export from this version",
+    "Открыть папку версии": "Open version folder",
+    "Идёт экспорт — дождитесь окончания.": "An export is running — wait until it finishes.",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -4196,8 +4210,8 @@ EN.update({
         "⏹ File download postponed. Chats are scanned — you can continue in «My exports».",
     "Проверка не удалась": "Test failed",
     "нет прогресса": "no progress",
-    "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси. Ничего не потеряется: программа продолжит сама, когда связь появится.":
-        "check that the VPN is on or the proxy (tg-ws-proxy) is running, and that the right proxy type is selected on the «Connection» page. Nothing will be lost: the program continues by itself once the connection is back.",
+    "проверьте, что включён VPN или запущен прокси, и что на странице «Подключение» выбран нужный вид прокси. Ничего не потеряется: программа продолжит сама, когда связь появится.":
+        "check that the VPN is on or the proxy is running, and that the right proxy type is selected on the «Connection» page. Nothing will be lost: the program continues by itself once the connection is back.",
 })
 
 # ----------------------------- английский: шаблоны -----------------------------
@@ -4256,9 +4270,9 @@ EN_RE.extend([
     (_R(r"Не хватает места на диске: освободите ещё (.+)\. Скачивание на паузе и продолжится само, как только место появится\."),
      _u(lambda m: f"Not enough disk space: free up {m.group(1)} more. Downloading is paused and continues by itself once there's space.")),
     # длинные подсказки о связи
-    (_R(r"(Нет связи с Telegram|Telegram долго не отвечает) — проверьте, что включён VPN или запущен прокси \(tg-ws-proxy\), и что на странице «Подключение» выбран нужный вид прокси\.(.*)"),
+    (_R(r"(Нет связи с Telegram|Telegram долго не отвечает) — проверьте, что включён VPN или запущен прокси, и что на странице «Подключение» выбран нужный вид прокси\.(.*)"),
      lambda m: ("No connection to Telegram" if m.group(1).startswith("Нет") else "Telegram isn't responding")
-        + " — check that the VPN is on or the proxy (tg-ws-proxy) is running, and that the right proxy type is selected on the «Connection» page."
+        + " — check that the VPN is on or the proxy is running, and that the right proxy type is selected on the «Connection» page."
         + {"": "", " Программа продолжит сама, когда связь появится.": " The program will continue by itself once the connection is back.",
            " Ничего не потеряется: программа продолжит сама, когда связь появится.": " Nothing will be lost: the program continues by itself once the connection is back.",
            " Можно нажать «Отмена», поменять настройки и подключиться снова.": " You can press «Cancel», change the settings and connect again."}.get(m.group(2), tr(m.group(2)))),
@@ -4281,6 +4295,12 @@ EN_RE.extend([
     (_R(r"Сканирование: (\d+) из (\d+)\. Закончится примерно (.+) \(осталось (.+), с учётом пауз Telegram\)\."),
      _u(lambda m: f"Scanning: {m.group(1)} of {m.group(2)}. Will finish around {m.group(3)} ({m.group(4)} left, incl. Telegram pauses).")),
     (_R(r"Сканирование завершено: (\d+) сообщений\."), r"Scan finished: \1 messages."),
+    (_R(r"Сохранённые версии сканирования: (\d+)…"), r"Saved scan versions: \1…"),
+    (_R(r"Шаг 2: прокси \((.+)\)\.\n\nТеперь ВЫКЛЮЧИТЕ VPN и запустите прокси, затем нажмите «ОК»\."),
+     r"Step 2: proxy (\1).\n\nNow TURN OFF the VPN and start the proxy, then press OK."),
+    (_R(r"Собрать экспорт из версии от (.+)\?\n\nHTML и JSON в папке чата будут пересобраны по этой версии\. Сама версия и остальные версии не изменятся\."),
+     r"Build an export from the version of \1?\n\nHTML and JSON in the chat folder will be rebuilt from this version. The version itself and other versions stay unchanged."),
+    (_R(r"(.+) · последняя"), r"\1 · latest"),
     (_R(r"Просканировано сообщений: (\d+)"), r"Messages scanned: \1"),
     (_R(r"Просканирован: (.+)"), r"Scanned: \1"),
     (_R(r"История уже просканирована \((\d+) сообщений\) — проверяю только новые\."),
@@ -5284,8 +5304,12 @@ class App:
         self.l_count.grid(row=1, column=0, sticky="w", pady=(S(2), 0))
 
         self.l_mode_sec = self.section(right, "Режим", 2, top=20)
-        self.cb_version = ttk.Combobox(right, textvariable=self.v_version, state="readonly")
-        self.cb_version.grid(row=3, column=0, sticky="ew")
+        self.vf_version = ttk.Frame(right)
+        self.vf_version.grid(row=3, column=0, sticky="ew")
+        self.cb_version = ttk.Combobox(self.vf_version, textvariable=self.v_version, state="readonly")
+        self.cb_version.pack(fill="x")
+        self.b_chat_versions = ttk.Button(self.vf_version, text="", style="Link.TButton",
+                                          command=lambda: self._chat_ver_row and self.show_versions(self._chat_ver_row))
         self.combos.append(self.cb_version)
         self.l_order_sec = self.section(right, "Порядок", 2, top=20)
         self.seg_order = Segmented(right, self.v_multi_mode, [("sequential", "По очереди"),
@@ -5556,7 +5580,7 @@ class App:
         if not hasattr(self, "l_chat_title"):
             return
         multi = len(getattr(self, "checked", ())) >= 2
-        for w in (self.l_mode_sec, self.cb_version):
+        for w in (self.l_mode_sec, self.vf_version):
             w.grid_remove() if multi else w.grid()
         for w in (self.l_order_sec, self.seg_order):
             w.grid() if multi else w.grid_remove()
@@ -5615,17 +5639,28 @@ class App:
             opts = [("Новый экспорт: вся история", None)]       # продолжать ещё нечего
         else:
             opts = [(self.VERSION_NEW, None), (self.VERSION_FULL, "full")]
-        try:
-            seen = set()
-            for d in dirs:
-                for m in list_snapshots(d):
-                    if m["id"] in seen:
-                        continue
-                    seen.add(m["id"])
-                    n = f"{m.get('total_msgs', 0):,}".replace(",", " ")
-                    opts.append((f"Из версии от {m.get('created', m['id'])} · {n} сообщ.", m["id"]))
-        except Exception:
-            pass
+        # версии сканирования — в отдельном окне чата; здесь только ссылка на него
+        def nsnap(dd):
+            vd = os.path.join(dd, VERSIONS_DIR)
+            try:
+                return sum(1 for n in os.listdir(vd)
+                           if not n.endswith(".tmp") and os.path.exists(os.path.join(vd, n, "meta.json")))
+            except OSError:
+                return 0
+        nver, vdir = 0, None
+        for d in dirs:
+            n = nsnap(d)
+            if n > nver:
+                nver, vdir = n, d
+        if nver:
+            name = self.dialog_map.get(chat, (None, os.path.basename(vdir)))[1] if hasattr(self, "dialog_map") \
+                else os.path.basename(vdir)
+            self._chat_ver_row = {"dir": vdir, "name": name, "peer": chat, "raw_id": None}
+            self.b_chat_versions.configure(text=f"Сохранённые версии сканирования: {nver}…")
+            self.b_chat_versions.pack(anchor="w", pady=(self.S(4), 0))
+        else:
+            self._chat_ver_row = None
+            self.b_chat_versions.pack_forget()
         cur = self.v_version.get()
         labels = [tr(o[0]) for o in opts]
         self.version_ids = [o[1] for o in opts]
@@ -5693,7 +5728,7 @@ class App:
         box, tv = self.make_tree(top, cols, selectmode="extended", hscroll=True, key="exports")
         box.grid(row=1, column=0, sticky="nsew")
         tv.bind("<<TreeviewSelect>>", lambda e: self.update_ex_buttons())
-        tv.bind("<Double-1>", lambda e: self.ex_open("html") if tv.identify_region(e.x, e.y) == "cell" else None)
+        tv.bind("<Double-1>", self.ex_double)
         tv.bind("<Return>", lambda e: self.ex_continue())
         tv.bind("<Button-3>", self.ex_menu_popup)
         self.ex_tv = tv
@@ -5707,7 +5742,7 @@ class App:
         self.theme_tk(m, lambda c, w=m: w.configure(bg=c["field"], fg=c["text"], activebackground=c["accent_soft"],
                                                     activeforeground=c["text"], disabledforeground=c["faint"],
                                                     bd=0, relief="flat", font=self.ui.f_body, activeborderwidth=0))
-        self.ex_menu_items = [("cont", "Продолжить"), ("full", "Начать заново"), ("ver", "Версии…"), None,
+        self.ex_menu_items = [("cont", "Продолжить"), ("full", "Начать заново"), ("ver", "Версии сканирования…"), None,
                               ("html", "Открыть HTML"), ("dir", "Открыть папку"), ("rep", "Отчёт")]
         for it in self.ex_menu_items:
             if it is None:
@@ -5948,7 +5983,7 @@ class App:
         cv.create_text(bx + S(8), by + th / 2, text=text, anchor="w", fill=c["text"], font=fnt, tags="hover")
 
     QUIET_PHASES = ("⏸", "⛔", "Пауза", "Сохраняю", "Создаю", "Собираю", "Проверяю", "Докачиваю", "Кастомные")
-    NET_HINT = "проверьте, что включён VPN или запущен прокси (tg-ws-proxy), и что на странице «Подключение» выбран нужный вид прокси"
+    NET_HINT = "проверьте, что включён VPN или запущен прокси, и что на странице «Подключение» выбран нужный вид прокси"
 
     def recheck(self):
         """«Проверить снова»: сразу проверить связь, не дожидаясь следующей попытки."""
@@ -6239,20 +6274,113 @@ class App:
 
     def ex_versions(self):
         sel = self.ex_selected()
-        if len(sel) != 1:
+        if len(sel) == 1 and sel[0].get("dir"):
+            self.show_versions(sel[0])
+
+    def show_versions(self, row):
+        """Окно «Версии сканирования» чата: снимки истории по датам; из любого можно собрать экспорт."""
+        S = self.S
+        snaps = list_snapshots(row["dir"]) if row.get("dir") else []
+        d, body, btns = self._modal("Версии сканирования")
+        ttk.Label(body, text=row.get("name") or os.path.basename(row["dir"]), style="Value.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Снимок истории сохраняется после каждого завершённого сканирования. Из любой версии "
+                             "можно собрать экспорт — в нём будут и сообщения, которые потом удалили. HTML и JSON "
+                             "в папке чата будут пересобраны по выбранной версии; уже скачанные файлы не качаются "
+                             "заново (файлы удалённых сообщений Telegram может уже не отдать).",
+                  style="Muted.TLabel", wraplength=S(620), justify="left").pack(anchor="w", pady=(S(6), S(12)))
+        fnt = self.ui.f_body
+
+        def W(sample):
+            return fnt.measure(sample) + S(26)
+        box, tv = self.make_tree(body, (("when", "Сканирование", W("23.11.2026 02:28 · последняя"), "w", False),
+                                        ("msgs", "Сообщений", W(tr("Сообщений")) + S(12), "e", False),
+                                        ("files", "Файлов", W(tr("Файлов")) + S(12), "e", False),
+                                        ("size", "Объём файлов", W(tr("Объём файлов")) + S(12), "e", False),
+                                        ("disk", "Занимает", W(tr("Занимает")) + S(12), "e", False)),
+                                 selectmode="browse", height=min(8, max(3, len(snaps))), key="versions")
+        box.pack(fill="both", expand=True)
+        for i, m in enumerate(snaps):
+            media = m.get("media") or {}
+            try:
+                nbytes = sum(int(v[1]) for v in media.values())
+            except Exception:
+                nbytes = 0
+            try:
+                disk = os.path.getsize(os.path.join(row["dir"], VERSIONS_DIR, m["id"], "records.jsonl.gz"))
+            except OSError:
+                disk = 0
+            when = m.get("created", m["id"]) + (" · последняя" if i == 0 else "")
+            tv.insert("", "end", iid=m["id"], values=(when, f"{m.get('total_msgs', 0):,}".replace(",", " "),
+                                                      f"{len(media):,}".replace(",", " "),
+                                                      human(nbytes) if nbytes else "—", human(disk) if disk else "—"))
+        if snaps:
+            tv.selection_set(snaps[0]["id"])
+            tv.focus(snaps[0]["id"])
+        else:
+            ttk.Label(body, text="Версий пока нет — первая появится после завершённого сканирования.",
+                      style="Muted.TLabel").pack(anchor="w", pady=(S(8), 0))
+
+        def chosen():
+            s = tv.selection()
+            return s[0] if s else None
+
+        def go():
+            vid = chosen()
+            if not vid:
+                return
+            cfg = self.collect_cfg()
+            if not self._ready_to_export(cfg):
+                return
+            pid = self.peer_of(row)
+            if not pid:
+                messagebox.showinfo("Чат", "Не удалось определить ID чата.", parent=d)
+                return
+            label = tv.set(vid, "when").split(" · ")[0]
+            if not messagebox.askyesno("Экспорт из версии",
+                                       f"Собрать экспорт из версии от {label}?\n\nHTML и JSON в папке чата "
+                                       "будут пересобраны по этой версии. Сама версия и остальные версии "
+                                       "не изменятся.", parent=d):
+                return
+            d.destroy()
+            self.start_single(cfg, pid, vid)
+
+        def open_dir():
+            vid = chosen()
+            p = os.path.join(row["dir"], VERSIONS_DIR, vid) if vid else os.path.join(row["dir"], VERSIONS_DIR)
+            if os.path.exists(p):
+                open_path(p)
+
+        ttk.Button(btns, text="Закрыть", command=d.destroy).pack(side="right")
+        b_go = ttk.Button(btns, text="Экспорт из этой версии", style="Accent.TButton", command=go)
+        b_go.pack(side="right", padx=(0, S(8)))
+        b_dir = ttk.Button(btns, text="Открыть папку версии", command=open_dir)
+        b_dir.pack(side="left")
+        if not snaps:
+            b_go.configure(state="disabled")
+            b_dir.configure(state="disabled")
+        elif self.busy:
+            b_go.configure(state="disabled")
+            ttk.Label(btns, text="Идёт экспорт — дождитесь окончания.", style="Small.TLabel").pack(
+                side="left", padx=(S(12), 0))
+        tv.bind("<Double-1>", lambda e: go() if tv.identify_region(e.x, e.y) == "cell" else None)
+        tv.bind("<Return>", lambda e: go())
+        d.bind("<Escape>", lambda e: d.destroy())
+        d.resizable(True, True)
+        self._show_modal(d)
+
+    def ex_double(self, e):
+        """Двойной щелчок: по колонке «Версий» — окно версий, по остальным — открыть HTML."""
+        tv = self.ex_tv
+        if tv.identify_region(e.x, e.y) != "cell":
             return
-        pid = self.peer_of(sel[0])
-        if pid:
-            if self.tv.exists(pid):
-                self.tv.selection_set(pid)
-                self.tv.see(pid)
-            else:
-                self.v_search.set(pid)
-            self.v_chat.set(pid)
-            self.refresh_versions()
-            self.show_page("export")
-            self.cb_version.focus_set()
-            self.set_phase("Выберите версию в поле «Режим» и нажмите «Начать экспорт».")
+        try:
+            col = tv.column(tv.identify_column(e.x), "id")
+        except tk.TclError:
+            col = ""
+        if col == "ver":
+            self.ex_versions()
+        else:
+            self.ex_open("html")
 
     def ex_open(self, what):
         sel = self.ex_selected()
@@ -6312,7 +6440,7 @@ class App:
         self.b_tko_check.pack(side="left", padx=(S(8), 0))
 
         self.section(pcol, "Прокси", 0, top=0, colspan=2)
-        Segmented(pcol, self.v_ptype, [("", "Без прокси"), ("mtproto", "MTProto (tg-ws-proxy)"),
+        Segmented(pcol, self.v_ptype, [("", "Без прокси"), ("mtproto", "MTProto"),
                                        ("socks5", "SOCKS5")], command=self.update_proxy_state,
                   k=self.ui.k).grid(row=1, column=0, columnspan=2, sticky="w")
         self.l_proxy_hint = ttk.Label(pcol, text="", style="Muted.TLabel", wraplength=S(440), justify="left")
@@ -6328,15 +6456,17 @@ class App:
             self.proxy_rows[key] = self.field_row(pcol, 3 + i, label, var, width=width, show=show)
 
         self.section(pcol, "Проверка связи", 9, top=24, colspan=2)
-        ttk.Label(pcol, text="Проверка идёт по шагам: сначала с включённым VPN, потом программа попросит "
-                             "выключить VPN и проверит прокси. Покажу пинг и скорость скачивания и подскажу, "
-                             "где быстрее.",
+        ttk.Label(pcol, text="«Проверить подключение» — пинг и скорость выбранного сейчас способа. "
+                             "«Диагностика» сравнит способы по шагам: сначала с включённым VPN, потом попросит "
+                             "выключить VPN и проверит прокси, и подскажет, где быстрее.",
                   style="Muted.TLabel", wraplength=S(460), justify="left").grid(row=10, column=0, columnspan=2,
                                                                                   sticky="w")
         db = ttk.Frame(pcol)
         db.grid(row=11, column=0, columnspan=2, sticky="w", pady=(S(10), S(8)))
-        self.b_diag = ttk.Button(db, text="Проверить подключение", command=self.on_diagnose)
-        self.b_diag.pack(side="left")
+        self.b_check = ttk.Button(db, text="Проверить подключение", command=self.on_check_current)
+        self.b_check.pack(side="left")
+        self.b_diag = ttk.Button(db, text="Диагностика…", command=self.on_diagnose)
+        self.b_diag.pack(side="left", padx=(S(8), 0))
         self.l_diag_note = ttk.Label(db, text="", style="Small.TLabel", wraplength=S(300), justify="left")
         self.l_diag_note.pack(side="left", padx=(S(12), 0))
         fnt = self.ui.f_body
@@ -6384,6 +6514,33 @@ class App:
                         dict(cfg, proxy_type="socks5")))
         return out
 
+    def _diag_cfg(self):
+        try:
+            cfg = self.collect_cfg()
+            int(cfg["api_id"])
+            if not cfg["api_hash"]:
+                raise ValueError
+            return cfg
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Нужны API ID и API hash", "Для проверки связи заполните API ID и API hash.",
+                                   parent=self.root)
+            return None
+
+    def on_check_current(self):
+        """Проверить только тот способ подключения, который выбран сейчас."""
+        cfg = self._diag_cfg()
+        if cfg is None:
+            return
+        kind = cfg.get("proxy_type") or ""
+        variants = [v for v in self.diag_variants(cfg) if v[1] == kind]
+        if not variants:
+            label = {"mtproto": "MTProto", "socks5": "SOCKS5"}.get(kind, kind)
+            variants = [(f"{label} {cfg.get('proxy_host')}:{cfg.get('proxy_port')}", kind, dict(cfg))]
+        self.diag_kind = {label: k for label, k, _ in variants}
+        self._diag_chats = [c for c in [self.v_chat.get().strip()] if c] + [str(d[0]) for d in self.dialogs[:8]]
+        self._diag_next = None
+        self.run_diag(variants)
+
     def on_diagnose(self):
         try:
             cfg = self.collect_cfg()
@@ -6402,7 +6559,7 @@ class App:
         self._diag_next = proxies
         if proxies:
             if not messagebox.askokcancel(
-                    "Проверка связи — шаг 1 из 2",
+                    "Диагностика — шаг 1 из 2",
                     "Шаг 1: VPN.\n\nВключите VPN (если пользуетесь им) и нажмите «ОК» — проверю подключение "
                     "без прокси.\n\nПотом попрошу выключить VPN и проверю прокси: VPN и прокси одновременно "
                     "мешают друг другу, поэтому замеры идут по очереди.", parent=self.root):
@@ -6411,6 +6568,7 @@ class App:
 
     def run_diag(self, variants, reuse_media=False):
         self.b_diag.configure(state="disabled")
+        self.b_check.configure(state="disabled")
         self.l_diag_note.configure(text="Проверяю… это займёт до полуминуты на вариант.")
         coro = self.worker.diagnose([(label, c) for label, _, c in variants], self._diag_chats,
                                     reuse_media=reuse_media)
@@ -6433,12 +6591,13 @@ class App:
             if nxt and not self.l_diag_note.cget("text").startswith("Проверка не"):
                 names = ", ".join(label for label, _, _ in nxt)
                 if messagebox.askokcancel(
-                        "Проверка связи — шаг 2 из 2",
-                        f"Шаг 2: прокси ({names}).\n\nТеперь ВЫКЛЮЧИТЕ VPN и запустите прокси "
-                        "(например, tg-ws-proxy), затем нажмите «ОК».", parent=self.root):
+                        "Диагностика — шаг 2 из 2",
+                        f"Шаг 2: прокси ({names}).\n\nТеперь ВЫКЛЮЧИТЕ VPN и запустите прокси"
+                        ", затем нажмите «ОК».", parent=self.root):
                     self.run_diag(nxt, reuse_media=True)
                     return
             self.b_diag.configure(state="normal")
+            self.b_check.configure(state="normal")
             if not self.l_diag_note.cget("text").startswith("Проверка не"):
                 self.l_diag_note.configure(text="Готово. Можно переключить VPN/прокси и проверить ещё раз.")
             self.pick_best()
@@ -6497,8 +6656,8 @@ class App:
 
     PROXY_HINTS = {
         "": "Подключение напрямую. Подходит, если VPN включён на весь компьютер.",
-        "mtproto": "Вставьте ссылку из tg-ws-proxy (значок в трее → «Скопировать ссылку») "
-                   "или заполните сервер, порт и секрет вручную.",
+        "mtproto": "Вставьте ссылку на прокси (tg://proxy?… или https://t.me/proxy?…) или заполните сервер, "
+                   "порт и секрет вручную. Подойдёт любой MTProto-прокси, в том числе локальный tg-ws-proxy.",
         "socks5": "Локальный SOCKS5-порт VPN-клиента или обычный SOCKS5-прокси.",
     }
 
@@ -6599,6 +6758,7 @@ class App:
             except tk.TclError:
                 pass
         self.themed = alive
+        self.trees = [tv for tv in self.trees if tv.winfo_exists()]   # таблицы закрытых окон — убираем
         for tv in self.trees:
             tv.tag_configure("failed", foreground=c["danger"])
             tv.tag_configure("running", foreground=c["accent"])
