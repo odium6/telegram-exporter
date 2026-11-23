@@ -2457,8 +2457,11 @@ class Worker:
         except (asyncio.CancelledError, StopRequested):
             self.log("⏹ Остановлено. При следующем запуске загрузка продолжится с места остановки.")
         except Exception as e:
-            self.log(f"❌ Ошибка: {e}")
-            self.q.put(("error", str(e)))
+            msg = str(e)
+            if "database is locked" in msg:
+                msg = "Файл входа (tg_export_session.session) занят: похоже, программа запущена дважды. Закройте лишние окна программы (или перезагрузите компьютер) и запустите её снова."
+            self.log(f"❌ Ошибка: {msg}")
+            self.q.put(("error", msg))
         finally:
             self.stats["running"] = False
             if self.logf:
@@ -2523,10 +2526,22 @@ class Worker:
                 pass
             self.client = None
         client = make_client(cfg, self.log)
-        await client.connect()
-        if not await client.is_user_authorized():
-            if not await self.login_qr(client):
-                await self.login_phone(client, cfg)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                if not await self.login_qr(client):
+                    await self.login_phone(client, cfg)
+        except BaseException:
+            # подключение отменили или оно не удалось — закрываем его, иначе файл входа останется занят
+            try:
+                await asyncio.wait_for(asyncio.shield(client.disconnect()), 10)
+            except BaseException:
+                pass
+            try:
+                client.session.close()
+            except Exception:
+                pass
+            raise
         self.client = client
         me = await client.get_me()
         self.log(f"✅ Вход выполнен: {ent_name(me)}")
@@ -4210,6 +4225,10 @@ EN.update({
     "Идёт экспорт — дождитесь окончания.": "An export is running — wait until it finishes.",
     "Переподключаюсь с текущими настройками…": "Reconnecting with the current settings…",
     "без прокси": "no proxy",
+    "Файл входа (tg_export_session.session) занят: похоже, программа запущена дважды. Закройте лишние окна программы (или перезагрузите компьютер) и запустите её снова.":
+        "The sign-in file (tg_export_session.session) is busy: the program seems to be running twice. Close the extra program windows (or restart the computer) and start it again.",
+    "Программа уже запущена — её окно открыто (возможно, свёрнуто на панели задач).":
+        "The program is already running — its window is open (maybe minimized to the taskbar).",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -7996,7 +8015,8 @@ class App:
         self.root.destroy()
         if restart:
             try:
-                subprocess.Popen([sys.executable] + sys.argv, cwd=APP_DIR)
+                subprocess.Popen([sys.executable] + [a for a in sys.argv if a != "--restarted"] + ["--restarted"],
+                                 cwd=APP_DIR)
             except Exception:
                 pass
 
@@ -8014,7 +8034,56 @@ def set_app_icon(root):
         pass
 
 
+_INSTANCE = None
+
+
+def single_instance(wait=0.0):
+    """Одна копия программы: две копии одновременно не могут работать с одним файлом входа в Telegram
+    («database is locked»). True — можно запускаться."""
+    global _INSTANCE
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        deadline = time.time() + wait
+        while True:
+            h = k32.CreateMutexW(None, False, "Local\\TelegramExporter.SingleInstance")
+            if k32.GetLastError() != 183:          # ERROR_ALREADY_EXISTS
+                _INSTANCE = h
+                return True
+            k32.CloseHandle(ctypes.c_void_p(h))
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.3)
+    except Exception:
+        return True
+
+
+def show_other_instance():
+    """Вывести на передний план уже открытое окно программы."""
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        hwnd = u32.FindWindowW(None, "Telegram Chat Exporter")
+        if hwnd:
+            u32.ShowWindow(hwnd, 9)                # SW_RESTORE
+            u32.SetForegroundWindow(hwnd)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
+    # после перезапуска (смена языка) старая копия ещё закрывается — подождём её
+    if not single_instance(wait=15 if "--restarted" in sys.argv else 0):
+        if not show_other_instance():
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showinfo("Telegram Exporter", "Программа уже запущена — её окно открыто (возможно, свёрнуто "
+                                                     "на панели задач).")
+            r.destroy()
+        return
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # чёткий шрифт на Windows
