@@ -5330,6 +5330,7 @@ class App:
         if changed and key == "exports":
             self.refresh_exports()
             self.root.after_idle(self._init_sash)
+            self.root.after(150, self.fit_details)
 
     # ---------- страница «Экспорт» ----------
     def _build_export_page(self):
@@ -6141,11 +6142,41 @@ class App:
             dh = int(self.cfg.get("details_h") or 0)
         except (TypeError, ValueError):
             dh = 0
-        dh = dh or max(self.details.winfo_reqheight(), int(h * 0.42))
+        dh = max(dh, self.details_need(), int(h * 0.42))      # все показатели видны сразу
         dh = max(self.S(150), min(dh, h - self.S(170)))
         try:
             pw.sashpos(0, h - dh)
             self._sash_done = True
+        except tk.TclError:
+            pass
+
+    def details_need(self):
+        """Высота панели деталей, при которой видно всё на вкладке «Общее»: ход, прогресс и все цифры
+        (даже если сейчас открыта другая вкладка или показатели ещё скрыты)."""
+        g = self.details_frames["general"]
+        hidden = [w for w in (self.pb, self.stats_frame) if not w.winfo_manager()]
+        for w in hidden:
+            w.grid()
+        try:
+            self.details.update_idletasks()
+            cur = self.details_frames.get(self.v_details_tab.get(), g)
+            need = self.details.winfo_reqheight() - cur.winfo_reqheight() + g.winfo_reqheight()
+        finally:
+            for w in hidden:
+                w.grid_remove()
+        return need + self.S(8)
+
+    def fit_details(self):
+        """Раздвинуть панель деталей, если цифры в неё не помещаются (только увеличивает)."""
+        pw = self.ex_pw
+        h = pw.winfo_height()
+        if not self._sash_done or h < self.S(200):
+            return
+        try:
+            cur = h - pw.sashpos(0)
+            need = min(self.details_need(), h - self.S(170))
+            if cur < need:
+                pw.sashpos(0, h - need)
         except tk.TclError:
             pass
 
@@ -6914,6 +6945,10 @@ class App:
         """Прогресс и показатели видны только во время работы или после неё — без пустых «—» в покое."""
         st = self.worker.stats
         active = bool(st.get("running")) or self.out_dir is not None
+        if active != getattr(self, "_was_active", False):
+            self._was_active = active
+            if active and hasattr(self, "ex_pw"):
+                self.root.after(80, self.fit_details)      # появились цифры — панель раздвигается под них
         for w in (self.pb, self.stats_frame):
             if active:
                 w.grid()
@@ -7149,6 +7184,9 @@ class App:
         self.scan_hist.clear()
         self.dl_eta = None
         self._select_running = True
+        self._was_active = False                            # новая работа — снова проверим, всё ли видно
+        self.v_details_tab.set("general")                   # при запуске — сразу цифры хода работы
+        self.show_details_tab()
         self.set_busy(True, stoppable=True)
         self.show_page("exports")
         self.refresh_exports()
