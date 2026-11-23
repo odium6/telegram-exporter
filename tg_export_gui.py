@@ -1873,6 +1873,10 @@ class StopRequested(Exception):
     pass
 
 
+class SwitchToQR(Exception):
+    """Код по номеру не пришёл — пользователь выбрал вход по QR-коду."""
+
+
 def folder_size(path):
     total = 0
     for root, _, files in os.walk(path):
@@ -1987,7 +1991,8 @@ CODE_WHERE = {
     "SentCodeTypeMissedCall": "пропущенным звонком (код — последние цифры номера звонившего)",
     "SentCodeTypeEmailCode": "на вашу почту, привязанную к Telegram",
     "SentCodeTypeFragmentSms": "через Fragment (для анонимных номеров)",
-    "SentCodeTypeFirebaseSms": "по SMS",
+    "SentCodeTypeFirebaseSms": "по SMS — но Telegram отправляет такое SMS только официальным приложениям "
+                               "(после проверки Google/Apple), поэтому сюда оно, скорее всего, не придёт",
     "SentCodeTypeSmsWord": "по SMS (кодовое слово)",
     "SentCodeTypeSmsPhrase": "по SMS (кодовая фраза)",
     "SentCodeTypeSetUpEmailRequired": "— Telegram требует сначала привязать почту в официальном приложении",
@@ -2528,9 +2533,14 @@ class Worker:
         client = make_client(cfg, self.log)
         try:
             await client.connect()
-            if not await client.is_user_authorized():
-                if not await self.login_qr(client):
+            while not await client.is_user_authorized():
+                if await self.login_qr(client):
+                    break
+                try:
                     await self.login_phone(client, cfg)
+                    break
+                except SwitchToQR:
+                    self.log("Перехожу ко входу по QR-коду.")
         except BaseException:
             # подключение отменили или оно не удалось — закрываем его, иначе файл входа останется занят
             try:
@@ -2631,9 +2641,15 @@ class Worker:
             code = await self.ask(
                 "text", "Код подтверждения",
                 f"Код отправлен: {where}\n\n"
-                "Введите код. Оставьте поле пустым и нажмите OK,\n"
-                "чтобы запросить код повторно (другим способом, если Telegram позволит).")
+                "Обычно Telegram присылает код не по SMS, а в чат «Telegram» (с синей галочкой) в приложении "
+                "на телефоне или компьютере, где вы уже вошли.\n\n"
+                "Введите код. Оставьте поле пустым и нажмите OK — код будет запрошен повторно "
+                "(другим способом, если Telegram позволит). «Отмена» — войти по QR-коду.")
             if code is None:
+                if await self.ask("yesno", "Код не пришёл?",
+                                  "Войти по QR-коду? Это надёжнее: код по номеру Telegram часто не отправляет "
+                                  "сторонним программам.\n\n«Нет» — отменить вход."):
+                    raise SwitchToQR()
                 raise StopRequested()
             code = re.sub(r"\D", "", code)
             if not code:
@@ -4229,6 +4245,16 @@ EN.update({
         "The sign-in file (tg_export_session.session) is busy: the program seems to be running twice. Close the extra program windows (or restart the computer) and start it again.",
     "Программа уже запущена — её окно открыто (возможно, свёрнуто на панели задач).":
         "The program is already running — its window is open (maybe minimized to the taskbar).",
+    "по SMS — но Telegram отправляет такое SMS только официальным приложениям (после проверки Google/Apple), поэтому сюда оно, скорее всего, не придёт":
+        "by SMS — but Telegram sends such SMS only to official apps (after a Google/Apple check), so it will most likely not arrive here",
+    "Перехожу ко входу по QR-коду.": "Switching to QR-code login.",
+    "Обычно Telegram присылает код не по SMS, а в чат «Telegram» (с синей галочкой) в приложении на телефоне или компьютере, где вы уже вошли.":
+        "Usually Telegram sends the code not by SMS but to the “Telegram” chat (blue check mark) in the app on a phone or computer where you are already logged in.",
+    "Введите код. Оставьте поле пустым и нажмите OK — код будет запрошен повторно (другим способом, если Telegram позволит). «Отмена» — войти по QR-коду.":
+        "Enter the code. Leave the field empty and press OK to request the code again (another way, if Telegram allows). “Cancel” — log in with a QR code.",
+    "Код не пришёл?": "No code?",
+    "Войти по QR-коду? Это надёжнее: код по номеру Telegram часто не отправляет сторонним программам.\n\n«Нет» — отменить вход.":
+        "Log in with a QR code? It is more reliable: Telegram often doesn't send phone codes to third-party apps.\n\n“No” cancels the login.",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
