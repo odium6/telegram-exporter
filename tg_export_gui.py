@@ -1833,7 +1833,8 @@ def make_client(cfg, log, session=None, quick=False):
     kwargs = dict(connection_retries=10, retry_delay=3, request_retries=10, timeout=30,
                   flood_sleep_threshold=120)
     if quick:      # диагностика: не ждать минутами, а быстро сказать «не работает»
-        kwargs.update(connection_retries=1, retry_delay=1, request_retries=1, timeout=12, auto_reconnect=False)
+        kwargs.update(connection_retries=1, retry_delay=1, request_retries=1, timeout=12, auto_reconnect=False,
+                      base_logger="tgdiag")   # свой журнал: проверка не должна включать «Нет связи» основного
     ptype = cfg["proxy_type"]
     if ptype == "mtproto":
         host, port, secret = cfg["proxy_host"], cfg["proxy_port"], cfg["proxy_secret"]
@@ -1871,6 +1872,31 @@ def make_client(cfg, log, session=None, quick=False):
 
 class StopRequested(Exception):
     pass
+
+
+def saved_auth_string():
+    """Сохранённый вход (файл tg_export_session.session) как StringSession — для проверки связи,
+    даже когда основное соединение не работает. Файл только читается."""
+    import sqlite3
+    from telethon.sessions import StringSession
+    from telethon.crypto import AuthKey
+    path = SESSION_PATH + ".session"
+    if not os.path.exists(path):
+        return ""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+        try:
+            row = con.execute("select dc_id, server_address, port, auth_key from sessions").fetchone()
+        finally:
+            con.close()
+        if not row or not row[3]:
+            return ""
+        s = StringSession()
+        s.set_dc(row[0], row[1], row[2])
+        s.auth_key = AuthKey(row[3])
+        return s.save()
+    except Exception:
+        return ""
 
 
 class SwitchToQR(Exception):
@@ -2720,7 +2746,7 @@ class Worker:
             self.q.put(("count_progress", i, n))
         self.q.put(("count_progress", n, n))
 
-    async def _test_media(self, chats):
+    async def _test_media(self, chats, client=None):
         """Файл для замера скорости: самое большое видео/документ из первых подходящих чатов."""
         from telethon.tl.types import InputMessagesFilterVideo, InputMessagesFilterDocument
         best = None
@@ -2728,7 +2754,7 @@ class Worker:
             for flt in (InputMessagesFilterVideo, InputMessagesFilterDocument):
                 try:
                     target = int(chat) if str(chat).lstrip("-").isdigit() else chat
-                    async for m in self.client.iter_messages(target, limit=15, filter=flt()):
+                    async for m in (client or self.client).iter_messages(target, limit=15, filter=flt()):
                         obj = media_object(m)
                         sz = media_size(m, obj) if obj is not None else 0
                         if sz and (best is None or sz > best[1]):
@@ -2752,52 +2778,98 @@ class Worker:
                 auth = StringSession.save(self.client.session)
             except Exception:
                 auth = ""
+        if not auth:
+            auth = saved_auth_string()      # основное соединение не работает — берём сохранённый вход
+        # подробный журнал проверки — рядом с программой (без ключей и паролей: их Telethon не пишет)
+        dlog = logging.getLogger("tgdiag")
+        dlog.setLevel(logging.DEBUG)
+        dlog.propagate = False
+        for h in list(dlog.handlers):
+            dlog.removeHandler(h)
+            h.close()
+        try:
+            fh = logging.FileHandler(os.path.join(APP_DIR, "connection_test.log"), mode="a", encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            dlog.addHandler(fh)
+            dlog.info("==== проверка связи: %s", ", ".join(label for label, _ in variants))
+        except Exception:
+            pass
         media = getattr(self, "_diag_media", None) if reuse_media else None
-        if media is None and self.client and auth:
+        if media is None and self.client and auth and not reuse_media:
             self.q.put(("diag_note", "Ищу файл для замера скорости…"))
             try:
-                media = await asyncio.wait_for(self._test_media(chats), 60)
-            except asyncio.TimeoutError:
+                media = await asyncio.wait_for(self._test_media(chats), 40)
+            except Exception:
                 media = None
+        if media is not None:
             self._diag_media = media      # на шаге «прокси» VPN уже выключен — файл ищем заранее
-        self.q.put(("diag_note", "" if media else
-                    "Подходящего файла для замера скорости не нашлось — проверяю только подключение и пинг."))
+        self.q.put(("diag_note", ""))
         for label, cfg in variants:
-            res = {"label": label, "ok": False, "connect": None, "ping": None, "speed": None, "error": ""}
+            res = {"label": label, "ok": False, "connect": None, "ping": None, "speed": None, "error": "",
+                   "login": None, "step": ""}
             self.q.put(("diag", label, "running", dict(res)))
             client = None
             try:
                 client = make_client(cfg, lambda *_: None, session=StringSession(auth), quick=True)
+                res["step"] = "подключение"
                 t0 = time.monotonic()
                 await asyncio.wait_for(client.connect(), 25)
                 res["connect"] = time.monotonic() - t0
+                res["step"] = "пинг"
                 pings = []
                 for _ in range(5):
                     t = time.monotonic()
                     await asyncio.wait_for(client(PingRequest(ping_id=random.getrandbits(63))), 15)
                     pings.append((time.monotonic() - t) * 1000)
                 res["ping"] = statistics.median(pings)
-                if media is not None:
-                    got, t = 0, time.monotonic()
+                if auth:
+                    res["step"] = "вход в аккаунт"
+                    me = await asyncio.wait_for(client.get_me(), 20)
+                    res["login"] = me is not None
+                    if not me:
+                        raise RuntimeError("вход не выполнен — войдите заново на странице «Подключение»")
+                    res["step"] = "список чатов"
+                    dialogs = await asyncio.wait_for(client.get_dialogs(limit=15), 30)
+                    m = media
+                    if m is None:
+                        res["step"] = "поиск файла для замера"
+                        try:
+                            m = await asyncio.wait_for(self._test_media([d.entity for d in dialogs], client), 40)
+                        except asyncio.TimeoutError:
+                            m = None
+                        if m is not None:
+                            media = self._diag_media = m
+                    if m is not None:
+                        res["step"] = "скачивание файла"
+                        got, t = 0, time.monotonic()
+                        err = []
 
-                    async def pull():
-                        nonlocal got
-                        async for chunk in client.iter_download(media[0], request_size=512 * 1024,
-                                                                file_size=media[1]):
-                            got += len(chunk)
-                            if time.monotonic() - t > 8 or got >= 24 * 1024 * 1024:
-                                break
-                    try:
-                        await asyncio.wait_for(pull(), 20)
-                    except asyncio.TimeoutError:
-                        pass
-                    dt = max(0.001, time.monotonic() - t)
-                    res["speed"] = got / dt if got else 0.0
+                        async def pull():
+                            nonlocal got
+                            async for chunk in client.iter_download(m[0], request_size=512 * 1024, file_size=m[1]):
+                                got += len(chunk)
+                                if time.monotonic() - t > 8 or got >= 24 * 1024 * 1024:
+                                    break
+                        try:
+                            await asyncio.wait_for(pull(), 20)
+                        except asyncio.TimeoutError:
+                            pass
+                        except Exception as e:
+                            err.append(e)
+                        dt = max(0.001, time.monotonic() - t)
+                        res["speed"] = got / dt if got else 0.0
+                        if not got:
+                            raise (err[0] if err else RuntimeError("за 20 с не пришло ни одного байта"))
+                res["step"] = ""
                 res["ok"] = True
             except (asyncio.CancelledError, StopRequested):
                 raise
             except Exception as e:
-                res["error"] = (str(e) or type(e).__name__)[:120]
+                res["error"] = (str(e) or type(e).__name__)[:160]
+                try:
+                    dlog.warning("%s: ошибка на шаге «%s»: %r", label, res["step"], e)
+                except Exception:
+                    pass
             finally:
                 if client is not None:
                     try:
@@ -4255,6 +4327,14 @@ EN.update({
     "Код не пришёл?": "No code?",
     "Войти по QR-коду? Это надёжнее: код по номеру Telegram часто не отправляет сторонним программам.\n\n«Нет» — отменить вход.":
         "Log in with a QR code? It is more reliable: Telegram often doesn't send phone codes to third-party apps.\n\n“No” cancels the login.",
+    "пинг есть, вход не проходит": "ping OK, login fails",
+    "вход есть, запросы не проходят": "logged in, requests fail",
+    "вход есть, файлы не качаются": "logged in, files don't download",
+    "ошибка": "error",
+    "подключение": "connection", "пинг": "ping", "вход в аккаунт": "account login", "список чатов": "chat list",
+    "поиск файла для замера": "finding a test file", "скачивание файла": "file download",
+    "за 20 с не пришло ни одного байта": "not a single byte arrived in 20 s",
+    "вход не выполнен — войдите заново на странице «Подключение»": "not logged in — log in again on the Connection page",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -4377,6 +4457,8 @@ EN_RE.extend([
      _u(lambda m: f"Scanning: {m.group(1)} of {m.group(2)}. Will finish around {m.group(3)} ({m.group(4)} left, incl. Telegram pauses).")),
     (_R(r"Сканирование завершено: (\d+) сообщений\."), r"Scan finished: \1 messages."),
     (_R(r"Сохранённые версии сканирования: (\d+)…"), r"Saved scan versions: \1…"),
+    (_R(r"(.+): ошибка на шаге «(.*)» — (.*)\. Подробности — в файле connection_test\.log рядом с программой\."),
+     lambda m: f"{m.group(1)}: failed at step “{tr(m.group(2))}” — {tr(m.group(3))}. Details are in connection_test.log next to the program."),
     (_R(r"Подключение \((.+)\)\.\.\."), r"Connecting (\1)..."),
     (_R(r"Подключение… \((.+)\)"), r"Connecting… (\1)"),
     (_R(r"Подключено: (.+) \((без прокси|MTProto .+|SOCKS5 .+)\)"), r"Connected: \1 (\2)"),
@@ -6591,8 +6673,8 @@ class App:
         self.b_check.pack(side="left")
         self.b_diag = ttk.Button(db, text="Диагностика…", command=self.on_diagnose)
         self.b_diag.pack(side="left", padx=(S(8), 0))
-        self.l_diag_note = ttk.Label(db, text="", style="Small.TLabel", wraplength=S(300), justify="left")
-        self.l_diag_note.pack(side="left", padx=(S(12), 0))
+        self.l_diag_note = ttk.Label(pcol, text="", style="Small.TLabel", wraplength=S(560), justify="left")
+        self.l_diag_note.grid(row=12, column=0, columnspan=2, sticky="w", pady=(0, S(6)))
         fnt = self.ui.f_body
 
         def W(sample):
@@ -6600,10 +6682,11 @@ class App:
         dbox, self.diag_tv = self.make_tree(pcol, (
             ("when", "Когда", W("23:59"), "w", False), ("var", "Вариант", W("MTProto 127.0.0.1:1443"), "w", False),
             ("ping", "Пинг", W("9999 мс"), "e", False), ("speed", "Скорость", W("99.9 МБ/с"), "e", False),
-            ("res", "Итог", W("не подключилось"), "w", False)), selectmode="browse", height=4, key="diag")
-        dbox.grid(row=12, column=0, columnspan=2, sticky="ew")
+            ("res", "Итог", W(tr("вход есть, файлы не качаются")), "w", False)), selectmode="browse", height=4,
+            key="diag")
+        dbox.grid(row=13, column=0, columnspan=2, sticky="ew")
         bb = ttk.Frame(pcol)
-        bb.grid(row=13, column=0, columnspan=2, sticky="w", pady=(S(8), 0))
+        bb.grid(row=14, column=0, columnspan=2, sticky="w", pady=(S(8), 0))
         self.l_diag_best = ttk.Label(bb, text="", style="Success.TLabel", wraplength=S(420), justify="left")
         self.l_diag_best.pack(side="left")
         self.b_diag_use = ttk.Button(bb, text="Выбрать этот вариант", style="Link.TButton", command=self.use_best)
@@ -6722,7 +6805,8 @@ class App:
                     return
             self.b_diag.configure(state="normal")
             self.b_check.configure(state="normal")
-            if not self.l_diag_note.cget("text").startswith("Проверка не"):
+            if not self.l_diag_note.cget("text").startswith(("Проверка не", tr("Проверка не"))) \
+                    and "connection_test.log" not in self.l_diag_note.cget("text"):
                 self.l_diag_note.configure(text="Готово. Можно переключить VPN/прокси и проверить ещё раз.")
             self.pick_best()
             return
@@ -6738,7 +6822,22 @@ class App:
             return
         ping = f"{res['ping']:.0f} мс" if res.get("ping") is not None else "—"
         speed = f"{human(res['speed'])}/с" if res.get("speed") else ("—" if res.get("ok") else "")
-        verdict = "работает" if res.get("ok") else "не подключилось"
+        step = res.get("step") or ""
+        if res.get("ok"):
+            verdict = "работает"
+        elif res.get("ping") is None:
+            verdict = "не подключилось"
+        elif step == "вход в аккаунт":
+            verdict = "пинг есть, вход не проходит"
+        elif step in ("список чатов", "поиск файла для замера"):
+            verdict = "вход есть, запросы не проходят"
+        elif step == "скачивание файла":
+            verdict = "вход есть, файлы не качаются"
+        else:
+            verdict = "ошибка"
+        if not res.get("ok"):
+            self.l_diag_note.configure(text=f"{label}: ошибка на шаге «{step}» — {res.get('error', '')}. "
+                                            "Подробности — в файле connection_test.log рядом с программой.")
         tv.item(iid, values=(time.strftime("%H:%M"), label, ping, speed, verdict),
                 tags=(() if res.get("ok") else ("failed",)))
         res["kind"] = getattr(self, "diag_kind", {}).get(label, "")
