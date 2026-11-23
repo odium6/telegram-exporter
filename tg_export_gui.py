@@ -4335,6 +4335,14 @@ EN.update({
     "поиск файла для замера": "finding a test file", "скачивание файла": "file download",
     "за 20 с не пришло ни одного байта": "not a single byte arrived in 20 s",
     "вход не выполнен — войдите заново на странице «Подключение»": "not logged in — log in again on the Connection page",
+    "Параметры скачивания": "Download settings", "Параметры скачивания…": "Download settings…",
+    "Экспорт сейчас идёт: после «Применить» он на секунду остановится и продолжится с того же места уже с новыми параметрами. Ничего не потеряется.":
+        "An export is running: after “Apply” it stops for a moment and continues from the same place with the new settings. Nothing is lost.",
+    "Параметры действуют для следующих запусков и продолжений экспорта.": "The settings apply to the next starts and continuations of exports.",
+    "ускоряет большие файлы": "speeds up large files", "потом файл попадает в отчёт": "then the file goes to the report",
+    "Применить": "Apply", "Сохранить": "Save",
+    "Применяю новые параметры скачивания…": "Applying new download settings…",
+    "▶ Продолжаю экспорт с новыми параметрами скачивания.": "▶ Continuing the export with the new download settings.",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -5886,6 +5894,8 @@ class App:
             self.ex_btns[key] = b
         self.b_ex_all = ttk.Button(bar, text="Продолжить незавершённые", command=self.ex_continue_unfinished)
         self.b_ex_all.pack(side="right")
+        ttk.Button(bar, text="Параметры скачивания…", command=self.dl_settings_dialog).pack(side="right",
+                                                                                            padx=(0, S(8)))
 
         fnt = self.ui.f_body
 
@@ -6574,6 +6584,56 @@ class App:
         tv.bind("<Return>", lambda e: go())
         d.bind("<Escape>", lambda e: d.destroy())
         d.resizable(True, True)
+        self._show_modal(d)
+
+    def dl_settings_dialog(self):
+        """Как качать: файлы одновременно, потоки, когда считать файл зависшим, повторы.
+        Во время экспорта новые значения применяются сразу: короткая остановка и продолжение с того же места."""
+        S = self.S
+        d, body, btns = self._modal("Параметры скачивания")
+        running = self.busy and self.stoppable and not self.connecting and getattr(self, "last_job", None)
+        ttk.Label(body, text=("Экспорт сейчас идёт: после «Применить» он на секунду остановится и продолжится "
+                              "с того же места уже с новыми параметрами. Ничего не потеряется."
+                              if running else "Параметры действуют для следующих запусков и продолжений экспорта."),
+                  style="Muted.TLabel", wraplength=S(460), justify="left").grid(row=0, column=0, columnspan=3,
+                                                                                 sticky="w", pady=(0, S(12)))
+        rows = (("Файлов одновременно", self.v_parallel, 1, 16, "оптимально 3–6"),
+                ("Потоков на файл больше 2 МБ", self.v_threads, 1, 8, "ускоряет большие файлы"),
+                ("Зависшим считать через, с", self.v_stall, 30, 1800, "если не пришло ни одного байта"),
+                ("Повторов перед пропуском", self.v_retries, 0, 10, "потом файл попадает в отчёт"))
+        local = []
+        for i, (label, var, lo, hi, tip) in enumerate(rows, start=1):
+            v = tk.StringVar(value=str(var.get()))
+            local.append((label, var, lo, hi, v))
+            ttk.Label(body, text=label, style="Muted.TLabel").grid(row=i, column=0, sticky="w", padx=(0, S(16)))
+            ttk.Spinbox(body, from_=lo, to=hi, textvariable=v, width=7).grid(row=i, column=1, sticky="w", pady=S(4))
+            ttk.Label(body, text=tip, style="Small.TLabel").grid(row=i, column=2, sticky="w", padx=(S(12), 0))
+
+        def apply():
+            vals = []
+            for label, var, lo, hi, v in local:
+                try:
+                    n = int(str(v.get()).strip())
+                except ValueError:
+                    messagebox.showwarning("Проверьте настройки", f"В поле «{label}» должно быть целое число.",
+                                           parent=d)
+                    return
+                vals.append((var, max(lo, min(hi, n))))
+            changed = any(str(var.get()) != str(n) for var, n in vals)
+            for var, n in vals:
+                var.set(n)
+            self.save_cfg()
+            d.destroy()
+            if changed and running and self.job and not self.job.done():
+                self._restart_with_params = True
+                self.set_phase("Применяю новые параметры скачивания…")
+                self.job.cancel()
+
+        ttk.Button(btns, text="Отмена", command=d.destroy).pack(side="right")
+        ttk.Button(btns, text="Применить" if running else "Сохранить", style="Accent.TButton",
+                   command=apply).pack(side="right", padx=(0, S(8)))
+        d.bind("<Escape>", lambda e: d.destroy())
+        d.bind("<Return>", lambda e: apply())
         self._show_modal(d)
 
     def ex_double(self, e):
@@ -7467,12 +7527,21 @@ class App:
             except tk.TclError:
                 pass
 
-    def relaunch_last_job(self):
-        """После переподключения продолжаем тот же экспорт с места остановки."""
+    SPEED_KEYS = ("parallel", "threads_per_file", "stall_timeout", "retries")
+
+    def relaunch_last_job(self, why="после переподключения"):
+        """Продолжаем тот же экспорт с места остановки (после переподключения или смены параметров скачивания)."""
         kind, cfg, target, version = self.last_job
+        try:
+            self.collect_cfg()
+        except (tk.TclError, ValueError):
+            pass
         cfg = dict(cfg, **{k: self.cfg[k] for k in ("proxy_type", "proxy_link", "proxy_host", "proxy_port",
-                                                    "proxy_secret", "proxy_user", "proxy_pass")})
-        self.log("▶ Продолжаю экспорт после переподключения.")
+                                                    "proxy_secret", "proxy_user", "proxy_pass") + self.SPEED_KEYS
+                           if k in self.cfg})
+        self.last_job = (kind, cfg, target, None if version == "full" else version)
+        self.log("▶ Продолжаю экспорт с новыми параметрами скачивания." if why == "params"
+                 else "▶ Продолжаю экспорт после переподключения.")
         self._begin_job()
         if kind == "single":
             self.job = self.worker.submit(self.worker.export_auto(cfg, target,
@@ -7990,7 +8059,11 @@ class App:
                     was_connecting = self.connecting
                     self.connecting = False
                     self.set_busy(False)
-                    if getattr(self, "_restart_connect", False):
+                    if getattr(self, "_restart_with_params", False):
+                        self._restart_with_params = False
+                        if getattr(self, "last_job", None) and self.worker.client:
+                            self.root.after(300, lambda: self.relaunch_last_job("params"))
+                    elif getattr(self, "_restart_connect", False):
                         self._restart_connect = False
                         self.root.after(300, self.on_connect)
                     elif getattr(self, "_reconnect_after_stop", False):
