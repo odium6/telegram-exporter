@@ -1799,6 +1799,36 @@ async def download_one(client, msg, path, size, bar, obj=None):
     return path
 
 
+def proxy_target(cfg):
+    """Куда реально идёт подключение: (вид, сервер, порт, секрет/логин) — ссылка важнее полей, как в make_client."""
+    ptype = cfg.get("proxy_type") or ""
+    host, port = str(cfg.get("proxy_host") or ""), str(cfg.get("proxy_port") or "")
+    if ptype == "mtproto":
+        secret = cfg.get("proxy_secret") or ""
+        link = (cfg.get("proxy_link") or "").strip()
+        if link:
+            try:
+                q = parse_qs(urlparse(link.replace("tg://proxy?", "https://t.me/proxy?")).query)
+                host = q.get("server", [host])[0]
+                port = q.get("port", [port])[0]
+                secret = q.get("secret", [secret])[0]
+            except Exception:
+                pass
+        return ("mtproto", host, port, (secret or "").strip())
+    if ptype == "socks5":
+        return ("socks5", host, port, cfg.get("proxy_user") or "")
+    return ("", "", "", "")
+
+
+def proxy_label(cfg):
+    t = proxy_target(cfg)
+    if t[0] == "mtproto":
+        return f"MTProto {t[1]}:{t[2]}"
+    if t[0] == "socks5":
+        return f"SOCKS5 {t[1]}:{t[2]}"
+    return "без прокси"
+
+
 def make_client(cfg, log, session=None, quick=False):
     kwargs = dict(connection_retries=10, retry_delay=3, request_retries=10, timeout=30,
                   flood_sleep_threshold=120)
@@ -2484,9 +2514,13 @@ class Worker:
 
     # ---- вход ----
     async def connect(self, cfg):
-        self.phase("Подключение...")
+        self.conn_target, self.conn_via = proxy_target(cfg), proxy_label(cfg)
+        self.phase(f"Подключение ({self.conn_via})...")
         if self.client:
-            await self.client.disconnect()
+            try:      # старое соединение могло зависнуть на неработающем прокси — не ждём его бесконечно
+                await asyncio.wait_for(self.client.disconnect(), 10)
+            except Exception:
+                pass
             self.client = None
         client = make_client(cfg, self.log)
         await client.connect()
@@ -4174,6 +4208,8 @@ EN.update({
     "Экспорт из версии": "Export from version", "Экспорт из этой версии": "Export from this version",
     "Открыть папку версии": "Open version folder",
     "Идёт экспорт — дождитесь окончания.": "An export is running — wait until it finishes.",
+    "Переподключаюсь с текущими настройками…": "Reconnecting with the current settings…",
+    "без прокси": "no proxy",
     "Открываю режим экспорта Telegram...": "Opening Telegram export mode...", "Считаю сообщения...": "Counting messages...",
     "Загрузка...": "Downloading...", "Докачиваю последние файлы...": "Finishing the last files...",
     "Собираю сообщения...": "Collecting messages...", "Проверяю скачанное...": "Checking downloaded files...",
@@ -4296,6 +4332,16 @@ EN_RE.extend([
      _u(lambda m: f"Scanning: {m.group(1)} of {m.group(2)}. Will finish around {m.group(3)} ({m.group(4)} left, incl. Telegram pauses).")),
     (_R(r"Сканирование завершено: (\d+) сообщений\."), r"Scan finished: \1 messages."),
     (_R(r"Сохранённые версии сканирования: (\d+)…"), r"Saved scan versions: \1…"),
+    (_R(r"Подключение \((.+)\)\.\.\."), r"Connecting (\1)..."),
+    (_R(r"Подключение… \((.+)\)"), r"Connecting… (\1)"),
+    (_R(r"Подключено: (.+) \((без прокси|MTProto .+|SOCKS5 .+)\)"), r"Connected: \1 (\2)"),
+    (_R(r"Настройки прокси изменены, но ещё не применены \(сейчас подключение: без прокси\)\. Нажмите «Переподключиться»\."),
+     r"Proxy settings changed but not applied yet (current connection: no proxy). Press “Reconnect”."),
+    (_R(r"Настройки прокси изменены, но ещё не применены \(сейчас подключение: (.+)\)\. Нажмите «Переподключиться»\."),
+     r"Proxy settings changed but not applied yet (current connection: \1). Press “Reconnect”."),
+    (_R(r"Подключение \(без прокси\)\.\.\."), r"Connecting (no proxy)..."),
+    (_R(r"Подключение… \(без прокси\)"), r"Connecting… (no proxy)"),
+    (_R(r"Подключено: (.+) \(без прокси\)"), r"Connected: \1 (no proxy)"),
     (_R(r"Шаг 2: прокси \((.+)\)\.\n\nТеперь ВЫКЛЮЧИТЕ VPN и запустите прокси, затем нажмите «ОК»\."),
      r"Step 2: proxy (\1).\n\nNow TURN OFF the VPN and start the proxy, then press OK."),
     (_R(r"Собрать экспорт из версии от (.+)\?\n\nHTML и JSON в папке чата будут пересобраны по этой версии\. Сама версия и остальные версии не изменятся\."),
@@ -5012,6 +5058,8 @@ class App:
         self.v_graph_period = tk.StringVar(value=str(c.get("graph_period", "300")))
         self.v_ex_filter = tk.StringVar(value=self.EX_FILTERS[0])
         self.v_plink.trace_add("write", lambda *a: self.fill_from_link())
+        for v in (self.v_ptype, self.v_plink, self.v_phost, self.v_pport, self.v_psecret, self.v_puser):
+            v.trace_add("write", lambda *a: hasattr(self, "l_conn_hint") and self.root.after_idle(self.update_account))
         self.v_manual = tk.StringVar()      # ручной ввод: @username, ссылка или ID (если чата нет в списке)
         self.v_manual.trace_add("write", lambda *a: self.on_manual_chat())
         self.v_search.trace_add("write", lambda *a: self.fill_dialogs())
@@ -6678,16 +6726,27 @@ class App:
         if t == "mtproto" and self.v_pport.get() == "1080":
             self.v_pport.set("1443")
 
+    def proxy_changed(self):
+        """Настройки прокси в полях отличаются от тех, с которыми идёт (или шло) подключение."""
+        used = getattr(self.worker, "conn_target", None)
+        if used is None:
+            return False
+        try:
+            return proxy_target(self.collect_cfg()) != used
+        except Exception:
+            return False
+
     def update_account(self):
         S = self.S
-        if self.account:
-            dot, name = "DotOn.TLabel", self.account
-            status = f"Подключено: {self.account}"
-            hint = "Сессия сохранена — при следующем запуске программа подключится сама."
-        elif self.connecting:
+        via = getattr(self.worker, "conn_via", None)
+        if self.connecting and self.busy:
             dot, name = "DotBusy.TLabel", "Подключение…"
-            status = "Подключение…"
+            status = f"Подключение… ({via})" if via else "Подключение…"
             hint = "Если откроется окно с QR-кодом, отсканируйте его в Telegram на телефоне."
+        elif self.account:
+            dot, name = "DotOn.TLabel", self.account
+            status = f"Подключено: {self.account}" + (f" ({via})" if via else "")
+            hint = "Сессия сохранена — при следующем запуске программа подключится сама."
         else:
             dot, name = "DotOff.TLabel", "Не подключено"
             status = "Не подключено"
@@ -6696,10 +6755,16 @@ class App:
         self.l_acc_dot.configure(style=dot)
         self.l_acc_name.configure(text=name)
         self.l_conn_status.configure(text=status, style="Value.TLabel")
-        self.l_conn_hint.configure(text=hint, style="Muted.TLabel")
+        hint_style = "Muted.TLabel"
+        if (self.account or self.connecting) and self.proxy_changed():
+            hint = ("Настройки прокси изменены, но ещё не применены (сейчас подключение: "
+                    f"{via}). Нажмите «Переподключиться».")
+            hint_style = "Warning.TLabel"
+        self.l_conn_hint.configure(text=hint, style=hint_style)
         exporting = self.busy and self.stoppable and not self.connecting
-        self.b_connect.configure(text="Переподключиться" if self.account else "Подключиться",
-                                 state="normal" if (not self.busy or exporting) else "disabled")
+        reconnect = self.account or (self.connecting and self.busy)
+        self.b_connect.configure(text="Переподключиться" if reconnect else "Подключиться",
+                                 state="normal" if (not self.busy or exporting or self.connecting) else "disabled")
         can_logout = (self.account or os.path.exists(SESSION_PATH + ".session")) and not self.busy
         self.b_logout.configure(state="normal" if can_logout else "disabled")
         if self.connecting and self.busy:
@@ -6798,6 +6863,7 @@ class App:
         self.l_phase.configure(text=text)
         if self.connecting and hasattr(self, "l_conn_phase"):
             self.l_conn_phase.configure(text=text.split(" — ")[0])
+            self.update_account()          # статус «Подключение… (через что)»
 
     def update_activity(self):
         """Прогресс и показатели видны только во время работы или после неё — без пустых «—» в покое."""
@@ -7043,6 +7109,13 @@ class App:
         self.refresh_exports()
 
     def on_connect(self):
+        if self.busy and self.connecting:
+            # подключение ещё идёт (возможно, через неработающий прокси) — начать заново с текущими настройками
+            self._restart_connect = True
+            self.set_phase("Переподключаюсь с текущими настройками…")
+            if self.job and not self.job.done():
+                self.job.cancel()
+            return
         if self.busy and self.stoppable and not self.connecting:
             # идёт экспорт: приостановить, переподключиться с новыми настройками и продолжить с того же места
             if not messagebox.askyesno(
@@ -7733,7 +7806,10 @@ class App:
                     was_connecting = self.connecting
                     self.connecting = False
                     self.set_busy(False)
-                    if getattr(self, "_reconnect_after_stop", False):
+                    if getattr(self, "_restart_connect", False):
+                        self._restart_connect = False
+                        self.root.after(300, self.on_connect)
+                    elif getattr(self, "_reconnect_after_stop", False):
                         self._reconnect_after_stop = False
                         self._relaunch_after_connect = True
                         self.root.after(300, self.on_connect)
