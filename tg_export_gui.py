@@ -6358,7 +6358,9 @@ class App:
             elif r["code"] == "done":
                 pct = "100%"
             elif r["want"]:
-                pct = f"{r['done'] * 100 // r['want']}%"
+                # по объёму, как во время скачивания (по числу файлов — колонка «Файлы»)
+                pct = (f"{r['done_bytes'] * 100 // r['want_bytes']}%" if r.get("want_bytes")
+                       else f"{r['done'] * 100 // r['want']}%")
             else:
                 pct = ""
             tag = r["code"] if r["code"] in ("running", "failed") else ""
@@ -8033,9 +8035,9 @@ class App:
             if mt:
                 pct = min(1.0, mn / mt)
                 self.stat["msgs"].configure(
-                    text=f"{mn:,} из {mt:,} ({pct * 100:.0f}%)".replace(",", " ")
+                    text=f"{mn:,} из {mt:,} ({int(pct * 100)}%)".replace(",", " ")
                     + (f" · {mrate:,.0f}/с".replace(",", " ") if mrate else ("" if mn >= mt else " · пауза")))
-                live["pct"] = f"{pct * 100:.0f}%"
+                live["pct"] = f"{int(pct * 100)}%"
             else:
                 self.stat["msgs"].configure(text=f"просканировано {mn:,}".replace(",", " "))
             self.pb["value"] = (min(1.0, mn / mt) * 1000) if mt else 0
@@ -8078,9 +8080,9 @@ class App:
             n_all, t_all = before + p.n, before + p.total     # прогресс — по всему чату, а не по остатку
             pct = min(1.0, n_all / t_all) if t_all else 0
             self.pb["value"] = pct * 1000
-            self.stat["bytes"].configure(text=f"{human(n_all)} / {human(t_all)} ({pct * 100:.0f}%)")
+            self.stat["bytes"].configure(text=f"{human(n_all)} / {human(t_all)} ({int(pct * 100)}%)")
             self.stat["speed"].configure(text=f"{human(cur)}/с · ср. {human(avg)}/с" if avg else "пауза…")
-            live.update(status="Идёт: скачивание", pct=f"{pct * 100:.0f}%",
+            live.update(status="Идёт: скачивание", pct=f"{int(pct * 100)}%",
                         speed=f"{human(cur)}/с" if cur else "пауза",
                         size=f"{human(n_all)} из {human(t_all)}")
             if avg > 0 and p.total > p.n:
